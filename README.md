@@ -1,4 +1,4 @@
-# 👁️ GazeKey – Eye-Controlled Virtual Keyboard
+# 👁️ GazeKey - Eye-Controlled Virtual Keyboard
 
 GazeKey is an accessible virtual keyboard that allows users to type using only their eyes and a standard webcam.
 
