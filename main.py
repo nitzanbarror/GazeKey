@@ -2,7 +2,10 @@
 
     python main.py
 
-Launch → calibration → validation gate → target practice → keyboard.
+Launch → 5-second setup check → calibration → validation gate → keyboard.
+(The aiming drill sits behind ``--practice``; the setup check is skippable with
+``--skip-setup-check`` and never blocks — a failed one offers to calibrate
+anyway.)
 
 **Every launch calibrates.** There is no "use the saved one?" question, because
 for this user population the honest answer is almost always no: the head is
@@ -41,6 +44,7 @@ from gaze.calibration import CalibrationModel
 from gaze.calibration_session import CalibrationSession
 from gaze.drift import DriftMonitor, TouchUpSession
 from gaze.region import attach_region, full_screen_region, read_region
+from gaze.setup_check import MIN_HY_SPAN, SetupCheckSession
 from interaction.controller import DwellController, DwellSettings
 from interaction.diagnostics import TypingDiagnostics
 from interaction.hotkey import HOTKEY_LABEL, GlobalQuitHotkey
@@ -53,6 +57,7 @@ from ui.choice_screen import ChoiceScreen
 from ui.exit_button import ExitButton
 from ui.overlay import KeyboardOverlay
 from ui.practice_screen import PracticeScreen
+from ui.setup_check_screen import SetupCheckScreen
 from ui.touchup_screen import TouchUpScreen
 from vision.pipeline import GazePipeline
 
@@ -187,7 +192,45 @@ class GazeKeyApp:
                 return
             print("[GazeKey] --use-saved: nothing stored for this screen and "
                   "camera - calibrating.")
-        self.run_calibration()
+        self.run_setup_check()
+
+    # ------------------------------------------------------- the setup check
+    def run_setup_check(self) -> None:
+        """Two dots, five seconds: is this sitting worth calibrating? (5.1c)
+
+        A camera below eye height is visible *before* the nine dots and
+        invisible during them — the user only finds out forty seconds later,
+        as a verdict they cannot interpret. This measures the one number that
+        predicts it and refuses to spend their patience on a sitting that
+        cannot work. It never blocks: the failure screen offers to calibrate
+        anyway.
+        """
+        if self.args.skip_setup_check:
+            print("[GazeKey] --skip-setup-check: going straight to the dots.")
+            self.run_calibration()
+            return
+
+        session = SetupCheckSession(
+            self.screen_size, region=self.region,
+            min_hy_span=float(self.config.get(
+                "setup_check_min_hy_span", MIN_HY_SPAN)))
+        print(f"[GazeKey] setup check: 2 targets, ~{session.budget_s:.0f} s, "
+              f"need an hy span of {session.min_hy_span:.3f} "
+              f"(--skip-setup-check to skip).")
+        screen = SetupCheckScreen(session, self.pipeline)
+
+        def finished(result) -> None:
+            if result is None:
+                print("[GazeKey] setup check cancelled.")
+                self.request_quit(code=1)
+                return
+            if not result.passed:
+                print(f"[GazeKey] WARNING: {result.text[0]} - "
+                      f"{result.measurement_line()}. Calibrating anyway.")
+            self.run_calibration()
+
+        screen.finished.connect(finished)
+        self._show(screen)
 
     # ------------------------------------------------------------- the flow
     def _show(self, widget) -> None:
@@ -520,6 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "keyboard (opt-in; the default goes straight to "
                              "typing)")
     parser.add_argument("--practice-targets", type=int, default=10)
+    parser.add_argument("--skip-setup-check", action="store_true",
+                        help="skip the 5-second camera check before the nine "
+                             "dots (it measures whether the camera can see "
+                             "your eyes move up and down at all)")
     parser.add_argument("--cal-region", choices=("keyboard", "full"),
                         default="keyboard",
                         help="what the 9 calibration dots span: the keyboard "
@@ -540,17 +587,17 @@ def build_parser() -> argparse.ArgumentParser:
         "default, so an absent flag changes nothing"
     )
     tuning.add_argument("--hysteresis", type=float, default=None, metavar="F",
-                        help="focused key's hit region grows by this fraction "
-                             "per side (default 0.25). NOTE: hit regions are "
-                             "gapless, so this currently only acts at the "
-                             "board edge, not between keys")
+                        help="the focused key keeps ownership over a region "
+                             "grown by this fraction per side (default 0.25); "
+                             "a neighbour has to win the point from outside it")
     tuning.add_argument("--min-cutoff", type=float, default=None, metavar="HZ",
                         help="One-Euro min_cutoff (default 1.0); lower is "
                              "smoother and laggier")
     tuning.add_argument("--grace-ms", type=float, default=None, metavar="MS",
-                        help="dwell decay after leaving a key (default 200). "
-                             "NOTE: only reached when the gaze leaves every "
-                             "key, not on a focus steal")
+                        help="how long a dwell survives losing its key "
+                             "(default 200), whether the gaze left every key "
+                             "or a neighbour stole focus; it decays over this "
+                             "and resumes if the gaze comes back")
     tuning.add_argument("--debug-typing", action="store_true",
                         help="log focus churn, dwell-loss causes, gaze "
                              "std-dev per axis and fixation duty cycle while "

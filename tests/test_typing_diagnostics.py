@@ -119,14 +119,24 @@ def test_lower_min_cutoff_actually_smooths_harder():
 
 
 # --------------------------------------------------- dwell-loss accounting
-def stare(controller, position, seconds, start=0.0, is_fixating=True,
-          stream_valid=True):
-    now = start
+def stare_all(controller, position, seconds, start=0.0, is_fixating=True,
+              stream_valid=True):
+    """Hold the gaze at ``position``; returns ``(activations, end time)``."""
+    activations, now = [], start
     for _ in range(max(1, int(round(seconds / DT)))):
         now += DT
-        controller.update(position[0], position[1], is_fixating,
-                          stream_valid, now)
-    return now
+        fired = controller.update(position[0], position[1], is_fixating,
+                                  stream_valid, now)
+        if fired is not None:
+            activations.append(fired)
+    return activations, now
+
+
+def stare(controller, position, seconds, start=0.0, is_fixating=True,
+          stream_valid=True):
+    """The same, for the many tests that only care where the clock ended."""
+    return stare_all(controller, position, seconds, start=start,
+                     is_fixating=is_fixating, stream_valid=stream_valid)[1]
 
 
 def test_a_clean_dwell_loses_nothing(board):
@@ -139,17 +149,24 @@ def test_a_clean_dwell_loses_nothing(board):
 
 
 def test_a_focus_steal_is_counted_and_named(board):
-    """One jittered frame across a row boundary — the reported failure."""
+    """One jittered frame across a row boundary — the reported failure.
+
+    It is only counted once the carried dwell has actually expired, because
+    until then nothing has been lost (NFR-7).
+    """
     controller = DwellController(board, DwellSettings())
     key, below = board.find("key.H"), board.find("key.N")
     now = stare(controller, key.centre, 0.7)
     assert controller.progress > 0.5
 
     controller.update(key.centre[0], below.centre[1], True, True, now + DT)
+    assert controller.stats.focus_stolen == 0, "still decaying, not yet lost"
+    assert controller.progress == 0.0, "the new key starts its own dwell at 0"
+
+    stare(controller, below.centre, 0.4, start=now + DT, is_fixating=False)
     stats = controller.stats
-    assert stats.focus_stolen == 1
+    assert stats.focus_stolen == 1, "away past the grace - now it is lost"
     assert stats.fixation_dropped == 0 and stats.grace_expired == 0
-    assert controller.progress == 0.0, "the dwell is discarded outright"
 
 
 def test_landing_on_a_key_with_no_progress_is_not_a_steal(board):
@@ -291,10 +308,12 @@ def test_the_summary_reports_the_session_and_names_a_cause(board):
     diagnostics.tick(0.0)
     key, below = board.find("key.H"), board.find("key.N")
     now = 0.0
-    for _ in range(6):                     # dwell, then get robbed by a wobble
+    for _ in range(6):                     # dwell, then get robbed for good:
         now = stare(controller, key.centre, 0.7, start=now)
-        controller.update(key.centre[0], below.centre[1], True, True, now + DT)
-        now += DT
+        # ...the gaze crosses the row and stays there past the grace, so the
+        # carried dwell expires. Not fixating while away, so the excursion
+        # accumulates nothing of its own to confuse the counts.
+        now = stare(controller, below.centre, 0.4, start=now, is_fixating=False)
     feed(diagnostics, [(key.centre[0], key.centre[1] + (50 if i % 2 else -50))
                        for i in range(60)])
     diagnostics.close(now=30.0)
@@ -302,6 +321,7 @@ def test_the_summary_reports_the_session_and_names_a_cause(board):
     summary = "\n".join(diagnostics.summary_lines())
     assert "typing-stability summary" in summary
     assert "focus stolen 6" in summary
+    assert "dwells recovered: 0" in summary
     assert "jitter" in summary and "spread" in summary
     assert "focus steals" in diagnostics.likely_cause()
     assert "Vertical is the worse axis" in diagnostics.likely_cause()
@@ -411,33 +431,82 @@ def test_an_overlay_without_diagnostics_is_unaffected(qapp, board):
         widget.close()
 
 
-# ------------------------------------------- what the knobs can and cannot do
-# Pinned because it is counter-intuitive and cost a debugging session: two of
-# the three stability knobs cannot affect typing *between* keys at all. If a
-# sticky-focus rule is ever adopted these tests should change with it.
-def test_hysteresis_does_nothing_between_keys(board):
-    """Hit regions are gapless, so the challenger always wins outright.
+# --------------------------------------------------- what the knobs now do
+# These replace the tests that pinned the two knobs as inert (NFR-7). Both are
+# live now: the margin decides ownership between keys, and a steal decays over
+# the grace instead of zeroing the dwell.
+def test_hysteresis_decides_ownership_between_keys(board):
+    """The focused key keeps the point until a challenger wins it outside.
 
-    ``_hit_test`` returns the first key whose *unexpanded* region contains the
-    point, and inside the board there is always one. The focused key's grown
-    region is only consulted when nothing owns the point — i.e. off the board.
+    Hit regions are gapless, so the old rule — first key whose *unexpanded*
+    region contains the point — handed every boundary crossing to the
+    neighbour and made the margin inert. Ownership must now move with it.
     """
     key = board.find("key.H")
+    probes = (-60, -47, -30, 0, 30, 47, 60)
     owners = {}
     for margin in (0.0, 0.25, 0.45, 0.90):
         controller = DwellController(board, DwellSettings(hysteresis_margin=margin))
         controller._focused = key
         owners[margin] = [
             (controller._hit_test(key.centre[0], key.centre[1] + dy) or key).id
-            for dy in (-60, -47, -30, 0, 30, 47, 60)
+            for dy in probes
         ]
-    assert len(set(map(tuple, owners.values()))) == 1, \
-        f"hysteresis changed ownership, so this note is out of date: {owners}"
-    assert "key.N" in owners[0.90], "a 47 px wobble still crosses the row"
+    assert len(set(map(tuple, owners.values()))) > 1, \
+        f"hysteresis still changes nothing between keys: {owners}"
+
+    half_row = board.smallest_key()[1] / 2.0
+    assert "key.N" in owners[0.0], "with no margin the row boundary is bare"
+    # 0.90 of a row grows the region far past a 47 px wobble in either direction
+    assert set(owners[0.90]) == {"key.H"}, \
+        f"a {half_row:.0f} px half-row should sit inside a 90% margin"
 
 
-def test_hysteresis_does_still_act_off_the_board(board):
-    """Where it is not dead: above the top row, nothing else owns the point."""
+def test_a_wider_margin_holds_focus_through_a_bigger_wobble(board):
+    """The knob's whole point: how far the gaze may stray and still count."""
+    key = board.find("key.H")
+    row = board.smallest_key()[1]
+    wobble = (key.centre[0], key.centre[1] + row * 0.65)    # 60 px on a 93 px row
+
+    tight = DwellController(board, DwellSettings(hysteresis_margin=0.05))
+    now = stare(tight, key.centre, 0.7)
+    tight.update(wobble[0], wobble[1], True, True, now + DT)
+    assert tight.focused_key.id == "key.N", "5% cannot cover that wobble"
+
+    generous = DwellController(board, DwellSettings(hysteresis_margin=0.25))
+    now = stare(generous, key.centre, 0.7)
+    generous.update(wobble[0], wobble[1], True, True, now + DT)
+    assert generous.focused_key.id == "key.H", "the default should have held"
+    assert generous.progress > 0.5, "and the dwell should never have paused"
+
+
+def test_a_key_always_owns_its_own_core(board):
+    """The bound on stickiness: looking straight at a key always selects it.
+
+    Space is 250 px wide against a 124 px Backspace beside it, so an unbounded
+    25% margin would reach past Backspace's centre and make it unselectable.
+    """
+    from interaction.controller import CORE_MARGIN
+
+    space, backspace = board.find("fn.space"), board.find("fn.backspace")
+    assert space.rect[2] > backspace.rect[2], "this only bites for a wide key"
+
+    for margin in (0.25, 0.9, 3.0):
+        controller = DwellController(board, DwellSettings(hysteresis_margin=margin))
+        controller._focused = space
+        assert controller._hit_test(*backspace.centre) is backspace, \
+            f"hysteresis {margin} swallowed a key the user is looking at"
+
+    # ...and the edge of that key is still the focused key's, as intended
+    controller = DwellController(board, DwellSettings(hysteresis_margin=0.25))
+    controller._focused = space
+    bx, by, bw, bh = backspace.rect
+    just_inside = (bx + bw * CORE_MARGIN * 0.5, by + bh / 2)
+    assert controller._hit_test(*just_inside) is space
+
+
+def test_hysteresis_still_acts_off_the_board(board):
+    """Unchanged: above the top row nothing else owns the point."""
     key = board.find("key.Q")
     above = key.rect[1] - key.rect[3] * 0.15
 
@@ -450,23 +519,111 @@ def test_hysteresis_does_still_act_off_the_board(board):
     assert generous._hit_test(key.centre[0], above) is key
 
 
-def test_a_focus_steal_bypasses_the_grace_period_entirely(board):
-    """Grace only runs when the gaze leaves *every* key, never on a steal."""
+def test_one_jittered_frame_no_longer_zeroes_the_dwell(board):
+    """The NFR-7 failure itself: 47 px of wobble on a 93 px row."""
     key, below = board.find("key.H"), board.find("key.N")
-    for grace in (0.0, 200.0, 2000.0):
-        controller = DwellController(board, DwellSettings(grace_ms=grace))
+    controller = DwellController(board, DwellSettings())
+    now = stare(controller, key.centre, 0.7)
+    before = controller.progress
+
+    controller.update(key.centre[0], below.centre[1], True, True, now + DT)
+    assert controller.focused_key.id == "key.N", "the steal still happens"
+    assert controller.stats.focus_stolen == 0, "not lost yet - it is decaying"
+
+    fired, _ = stare_all(controller, key.centre, 0.6, start=now + DT)
+    assert controller.stats.focus_recovered == 1
+    assert len(fired) == 1, "the dwell should have resumed and completed"
+    assert controller.stats.focus_stolen == 0, "nothing was actually lost"
+    # a reset would have needed the full second again
+    assert before > 0.5
+
+
+def test_a_steal_decays_over_the_grace_and_then_counts_as_lost(board):
+    """Away too long and it is gone — and named as the steal it was."""
+    key, below = board.find("key.H"), board.find("key.N")
+    controller = DwellController(board, DwellSettings(grace_ms=200))
+    now = stare(controller, key.centre, 0.7)
+    stolen = controller.progress
+
+    now = stare(controller, below.centre, 0.1, start=now)      # half the grace
+    now = stare(controller, key.centre, 0.001, start=now)      # one frame back
+    assert 0.3 * stolen < controller.progress < 0.8 * stolen, \
+        "the carried dwell should have decayed by about half"
+
+    controller = DwellController(board, DwellSettings(grace_ms=200))
+    now = stare(controller, key.centre, 0.7)
+    stare(controller, below.centre, 0.4, start=now)            # twice the grace
+    assert controller.stats.focus_stolen == 1
+    assert controller.stats.focus_recovered == 0
+    assert controller.stats.grace_expired == 0, "a steal, not a walk-off"
+
+
+def test_the_grace_knob_sets_how_long_a_steal_survives(board):
+    key, below = board.find("key.H"), board.find("key.N")
+
+    def progress_after_away(grace_ms, away_s):
+        controller = DwellController(board, DwellSettings(grace_ms=grace_ms))
         now = stare(controller, key.centre, 0.7)
-        controller.update(key.centre[0], below.centre[1], True, True, now + DT)
-        assert controller.progress == 0.0, \
-            f"grace_ms={grace} did not soften the steal"
-        assert controller.stats.grace_expired == 0
+        now = stare(controller, below.centre, away_s, start=now)
+        stare(controller, key.centre, 0.001, start=now)
+        return controller.progress
+
+    assert progress_after_away(0.0, 0.1) == 0.0, "zero grace = the old rule"
+    assert 0.0 < progress_after_away(200.0, 0.1) < progress_after_away(600.0, 0.1)
 
 
-def test_smoothing_is_the_only_knob_that_reaches_the_jitter(board):
-    """The one knob that does bite: less residual wobble, fewer boundaries hit.
+def test_the_refractory_is_unaffected_by_a_carried_dwell(board):
+    """A key that just fired still cannot re-fire early, carry or no carry."""
+    key, below = board.find("key.H"), board.find("key.N")
+    controller = DwellController(board, DwellSettings())
+    fired, now = stare_all(controller, key.centre, 1.1)
+    assert len(fired) == 1
+
+    now = stare(controller, below.centre, 0.1, start=now)   # part-dwell on N
+    fired, now = stare_all(controller, key.centre, 0.1, start=now)
+    assert fired == [], "H repeated inside its 400 ms refractory"
+    assert controller.progress == 0.0
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_the_new_rules_type_where_the_old_ones_could_not(board, seed):
+    """The whole point of NFR-7, measured over a minute of jittery gaze.
+
+    The old behaviour is reproducible exactly — margin 0, grace 0 — so this
+    compares the two rules on the same stream rather than asserting a number
+    out of the air. White noise is harsher than real (One-Euro smoothed,
+    frame-correlated) gaze, so treat the counts as a floor.
+    """
+    import random
+
+    def type_for(settings, seconds=60.0, jitter_x=10.0, jitter_y=34.0):
+        rng = random.Random(seed)
+        controller = DwellController(board, settings)
+        key = board.find("key.H")
+        now = 0.0
+        for _ in range(int(seconds / DT)):
+            now += DT
+            controller.update(key.centre[0] + rng.gauss(0, jitter_x),
+                              key.centre[1] + rng.gauss(0, jitter_y),
+                              True, True, now)
+        return controller.stats
+
+    # 34 px of vertical wobble on a 93 px row: a plausible good sitting
+    before = type_for(DwellSettings(hysteresis_margin=0.0, grace_ms=0.0))
+    after = type_for(DwellSettings())
+
+    assert before.activations <= 5, "the old rule was not the problem after all"
+    assert after.activations >= 20, "the fix does not survive real jitter"
+    assert after.focus_recovered > after.focus_stolen, \
+        "most interruptions should be recovered, not lost"
+    assert after.focus_changes < before.focus_changes / 2, "still flapping"
+
+
+def test_smoothing_still_reaches_the_jitter(board):
+    """The knob that reduces the wobble itself, rather than tolerating it.
 
     Measured as the peak-to-peak the filter still passes, against the half-row
-    a wobble has to clear to steal focus.
+    a wobble has to clear to reach the neighbour at all.
     """
     from gaze.smoothing import OneEuroFilter
 
@@ -483,4 +640,4 @@ def test_smoothing_is_the_only_knob_that_reaches_the_jitter(board):
     # raw wobble is where the setting still decides the outcome outright.
     half_row = board.smallest_key()[1] / 2.0
     assert amplitude(0.3, raw=100.0) < half_row < amplitude(4.0, raw=100.0), \
-        "at this wobble size the setting decides whether focus is stolen"
+        "at this wobble size the setting decides whether the row is crossed"

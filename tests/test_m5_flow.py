@@ -434,6 +434,9 @@ def test_every_launch_calibrates(gazekey, monkeypatch):
                         lambda: ran.append("practice"))
     monkeypatch.setattr(CalibrationModel, "load",
                         classmethod(lambda cls, *a: CalibrationModel()))
+    # the 5-second setup check now sits in front of the dots; that it leads to
+    # them (and what happens when it fails) is pinned in test_main_flow.py
+    monkeypatch.setattr(gazekey, "run_setup_check", gazekey.run_calibration)
 
     gazekey.args = parse()
     gazekey._start_calibration_or_saved()
@@ -503,6 +506,7 @@ def test_the_dev_flag_falls_back_to_calibrating(gazekey, monkeypatch):
                         lambda *a, **k: ran.append("calibrate"))
     monkeypatch.setattr(CalibrationModel, "load",
                         classmethod(lambda cls, *a: None))
+    monkeypatch.setattr(gazekey, "run_setup_check", gazekey.run_calibration)
 
     gazekey.args = parse("--use-saved")
     gazekey._start_calibration_or_saved()

@@ -4,7 +4,9 @@ A desktop virtual keyboard driven by eye gaze from a standard webcam, for users
 with motor disabilities. Gaze is estimated from the webcam, keys are selected by
 dwell time, and real OS keystrokes are injected into the focused application.
 
-**Status: Milestones 1-5 complete, with word prediction (M6) pulled forward.**
+**Status: Milestones 1-5 complete, with word prediction (M6) pulled forward,
+plus region-scoped calibration, point-level calibration repair, the NFR-7
+typing-stability fixes and the pre-calibration setup check.**
 
 ## Install and run
 
@@ -37,12 +39,27 @@ global hotkey cannot register, the banner says so rather than pretending.
 
 ```
 launch
+  ├─ setup check    2 targets, ~5 s: can the camera see your eyes move up/down?
   ├─ calibration    9 targets over the KEYBOARD AREA, then 3 validation targets
   ├─ result         measured in-region error + verdict + diagnostics map
   └─ keyboard       type into whatever app you click into
                       ├─ Fix aim   →  1 target, ~2.5 s  →  back to typing
                       └─ Recal.    →  9 targets         →  back to typing
 ```
+
+**The setup check comes first, and takes about five seconds.** A camera below
+eye height is the single most common way a session is wasted: the eyelids crop
+the iris, the vertical signal collapses, and the user only finds out forty
+seconds later as a verdict they cannot interpret. Two dots — top and bottom of
+the calibration area — measure how far the vertical iris ratio actually travels.
+Measured on this machine: **0.051 sitting well, 0.024 with the camera too low**
+(which calibrated to 117 px and typed nothing at all in 47 s). Below the
+threshold (0.035) the screen says *"Camera looks too low — raise the laptop so
+the camera is at eye height"*, and offers **Space** to check again, **Enter** to
+calibrate anyway, **Esc** to quit. It never blocks, it always prints the number,
+and `--skip-setup-check` turns it off. It runs at startup only: it is answered
+from the keyboard (there is no calibration yet to aim with), and raising a
+camera needs hands anyway.
 
 **Every launch calibrates.** There is no "use the saved one?" question, because
 for these users the honest answer is almost always *no*: the head is re-seated
@@ -138,14 +155,15 @@ python main.py --debug-typing
 Every 5 s (`--debug-interval`) it prints one line, and a summary on quit:
 
 ```
-[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0
+[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0  saved 3
                 jitter x   6 y  45 px  spread x 201 y  69  fixating 100%  keys 0
 ```
 
 | | |
 |---|---|
-| `focus /s` | how often the focused key changes. Healthy is under ~1/s; 10/s is flapping |
-| `steal` | dwells discarded because a neighbour took focus mid-hold |
+| `focus /s` | how often the focused key changes. Healthy is under ~1.5/s; 10/s is flapping |
+| `steal` | dwells lost because a neighbour took focus and the gaze did not come back in time |
+| `saved` | steals where it *did* come back inside the grace, and the dwell carried on. Nothing was lost |
 | `fixdrop` | dwells stalled because the fixation detector let go |
 | `grace` | dwells that decayed away after the gaze left every key |
 | `jitter x/y` | median wobble inside ~1/3 s buckets — the number that predicts steals. Compare against the key size |
@@ -160,12 +178,23 @@ Three knobs, each falling back to config and then to the default, so an absent
 flag changes nothing: `--hysteresis` (0.25), `--min-cutoff` (One-Euro, 1.0 —
 lower is smoother and laggier), `--grace-ms` (200).
 
-> **Two of those three are currently inert for typing between keys**, and the
-> app says so in `--help`. Hit regions are gapless, so a neighbour always wins
-> focus outright and the hysteresis margin is only consulted off the board;
-> and a focus steal discards the dwell instantly without ever reaching the
-> grace decay. Only `--min-cutoff` reduces the jitter that causes the steals.
-> Spec NFR-7 has the measurements and the candidate fixes.
+**All three are live.** Two of them used to be inert, which is what NFR-7 in the
+spec measured and what the current rules fix:
+
+* `--hysteresis` — the focused key is asked *first*, so its grown region really
+  does decide ownership and a neighbour has to win the point from outside it.
+  Bounded so that a key always owns its middle half: a focused Space (250 px)
+  can never swallow the 124 px Backspace beside it, however wide the margin.
+* `--grace-ms` — a dwell now survives *losing* its key, not just the board. The
+  interrupted dwell is carried and decays over the grace, so one jittered frame
+  across a row boundary costs a frame of decay rather than the whole second, and
+  coming back resumes it. `--grace-ms 0` restores the old discard-on-steal rule.
+* `--min-cutoff` — unchanged: it reduces the wobble itself rather than
+  tolerating it.
+
+A healthy session has `keys` ≈ 90% of dwell attempts, `steal` low and below
+`saved`, `fixdrop` and `grace` near zero, `focus` under ~1.5/s, and `jitter y`
+under about a quarter of the row height.
 
 ## Word prediction
 
@@ -268,6 +297,24 @@ says why and `Space` repeats it. Without it, head movement wrecks accuracy
 anyone whose head is not held still. Which mode ran is recorded in the
 diagnostics line of every result.
 
+### The setup check
+
+| | |
+|---|---|
+| `--skip-setup-check` | skip the two-target camera check before calibration |
+| `setup_check_min_hy_span` | the threshold it judges against (config, default **0.035**) |
+
+Two dots at the top and bottom of the calibration area, ~5 s, measuring how far
+the vertical iris ratio travels between them — the same `hy span` the
+diagnostics print after a session, so the two numbers can be compared directly.
+Below the threshold it says the camera looks too low and offers **Space** to
+re-check, **Enter** to calibrate anyway and **Esc** to quit. The measurement is
+printed either way:
+
+```
+[GazeKey] setup check PASS: hy span 0.051 (top 0.302, bottom 0.353, 30+30 samples, threshold 0.035)
+```
+
 ### Pacing
 
 | Flag | Default | |
@@ -306,8 +353,13 @@ Everything in spec Section 7, all configurable in `~/.gazekey/config.json`:
 * dwell **1.0 s**, and it only advances while the fixation detector agrees the
   gaze is actually held — a travelling gaze never types;
 * **2.0 s** extended dwell on Pause, Fix aim, Recalibrate, EN/HE and Quit;
-* **hysteresis** 25%, **grace** 200 ms decay on leaving, **refractory** 400 ms
-  before the same key can repeat;
+* **hysteresis** 25% — the focused key keeps ownership over a region grown by a
+  quarter on each side, and a neighbour has to win the point from outside it
+  (bounded so every key always owns its own middle half);
+* **grace** 200 ms — a dwell that loses its key decays over the grace instead of
+  vanishing, whether the gaze left the board *or* a neighbour stole focus, and
+  coming back inside that window resumes it;
+* **refractory** 400 ms before the same key can repeat;
 * a lost stream **freezes** the dwell rather than resetting it, so a blink
   mid-key costs a moment, not the whole selection;
 * **Shift** latches for exactly one character;
@@ -581,7 +633,10 @@ gaze/                  VERIFIED CORE — calibration math, do not rewrite
   smoothing.py         One-Euro filter, I-DT fixation detector
   calibration_session.py   session sequencing over that core (not math)
   drift.py             drift monitor + one-point touch-up (M5)
+  region.py            the calibration region and its persistence
+  setup_check.py       the 5 s camera check before calibration
 ui/
+  setup_check_screen.py    the two-target camera check
   calibration_screen.py    9 points / validation / results (+ head sweep)
   gaze_demo.py             M2 checkpoint gaze dot
   practice_screen.py       aiming drill + summary
@@ -658,11 +713,13 @@ tests/
   because a paged split destroys QWERTY's muscle memory anyway, and scanning
   for a letter is what actually costs time when selecting by gaze.
 * **Hit regions are gapless.** Keys are drawn with a visual inset but their hit
-  rectangles touch, so there are no dead zones between them. That means the
-  hysteresis margin does nothing *between* neighbours (the neighbour owns that
-  point outright) and everything at the board's outer edge and under the
-  non-selectable suggestion strip, which is where a slightly-off prediction
-  would otherwise drop the dwell with nothing to hand it to.
+  rectangles touch, so there are no dead zones between them. That is why the
+  focused key is asked *first* in the hit test: asking the neighbours first
+  handed them every boundary crossing and made the hysteresis margin inert
+  between keys, which is what spec NFR-7 measured. Since the margin is a
+  fraction of the *focused* key's own size, it is bounded by a fixed core — the
+  middle half of every key belongs to that key whatever the margin is — so a
+  wide Space cannot swallow the narrow Backspace beside it.
 * **The suggestion bar is display-only until M6.** The three slots exist in the
   geometry per spec Section 8 but are not dwell targets, so they are exempt
   from NFR-2 sizing and drawn as a slim strip rather than eating a whole row.
@@ -711,8 +768,10 @@ tests/
 
 Video frames and landmarks stay in memory and are never written to disk. The
 only files GazeKey writes are `~/.gazekey/config.json`,
-`~/.gazekey/calibration.json` (coefficients, not imagery) and the cached model
-bundle. No network access at runtime beyond the one-time model download.
+`~/.gazekey/calibration.json` (coefficients, not imagery),
+`~/.gazekey/user_words.json` (words and counts only, never sentences) and the
+cached model bundle. No network access at runtime beyond the one-time model
+download.
 
 ## Tests
 
@@ -735,4 +794,7 @@ painter draws from) and check geometry against the painted pixels.
 | M3 | One-Euro smoothing + fixation detection | **done** |
 | M4 | keyboard overlay + dwell + keystroke injection | **done** |
 | M5 | drift monitor + 1-point touch-up + in-place recalibration | **done** |
+| — | region-scoped calibration + point-level repair | **done** |
+| — | typing stability (NFR-7): sticky focus, dwell survives a steal | **done** |
+| — | the 5-second setup check before calibration | **done** |
 | M6 | Hebrew layout + RTL | next — English word prediction **done** early |

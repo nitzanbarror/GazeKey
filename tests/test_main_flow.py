@@ -34,6 +34,11 @@ def test_practice_is_opt_in_now():
     assert parse("--practice").practice is True
 
 
+def test_the_setup_check_is_on_by_default_and_skippable():
+    assert parse().skip_setup_check is False, "a bad sitting is worth 5 seconds"
+    assert parse("--skip-setup-check").skip_setup_check is True
+
+
 def test_the_flow_can_be_steered_from_the_cli():
     assert parse("--use-saved").use_saved is True
     assert parse("--practice").practice is True
@@ -112,6 +117,117 @@ def test_user_words_live_beside_the_calibration():
 
     assert app_main.user_words_path().startswith(app_dir())
     assert app_main.user_words_path().endswith("user_words.json")
+
+
+# ------------------------------------------------------- the setup check (5.1c)
+class FakeSignal:
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+    def emit(self, value):
+        for slot in list(self.slots):
+            slot(value)
+
+
+class FakeScreen:
+    """Stands in for SetupCheckScreen, without a window or a camera."""
+
+    instances = []
+
+    def __init__(self, session, pipeline=None, **kwargs):
+        self.session = session
+        self.finished = FakeSignal()
+        FakeScreen.instances.append(self)
+
+
+@pytest.fixture
+def staged(monkeypatch):
+    """A GazeKeyApp whose screens are recorded instead of shown."""
+    FakeScreen.instances = []
+    monkeypatch.setattr(app_main, "SetupCheckScreen", FakeScreen)
+    return FakeScreen
+
+
+def wire(gazekey, shown, calibrated):
+    gazekey._show = shown.append
+    gazekey.run_calibration = lambda *a, **k: calibrated.append(True)
+
+
+def test_the_check_runs_before_the_nine_dots(gazekey, staged):
+    shown, calibrated = [], []
+    wire(gazekey, shown, calibrated)
+    gazekey.run_setup_check()
+
+    assert len(shown) == 1 and isinstance(shown[0], staged)
+    assert calibrated == [], "nothing is calibrated until the check answers"
+
+    shown[0].finished.emit(_passing_result())
+    assert calibrated == [True], "a passed check goes straight to the dots"
+
+
+def test_the_check_measures_over_the_calibration_region(gazekey, staged):
+    shown = []
+    wire(gazekey, shown, [])
+    gazekey.run_setup_check()
+
+    session = shown[0].session
+    assert session.region == gazekey.region, \
+        "checking outside the calibrated area would measure the wrong thing"
+    assert all(gazekey.region.contains(*t) for t in session.targets)
+
+
+def test_the_threshold_comes_from_config(gazekey, staged):
+    gazekey.config["setup_check_min_hy_span"] = 0.07
+    shown = []
+    wire(gazekey, shown, [])
+    gazekey.run_setup_check()
+    assert shown[0].session.min_hy_span == pytest.approx(0.07)
+
+
+def test_skipping_the_check_goes_straight_to_the_dots(staged):
+    gazekey = app_main.GazeKeyApp(StubApp(), parse("--skip-setup-check"))
+    shown, calibrated = [], []
+    wire(gazekey, shown, calibrated)
+    gazekey.run_setup_check()
+
+    assert shown == [] and calibrated == [True]
+
+
+def test_cancelling_the_check_ends_the_app(gazekey, staged):
+    shown, calibrated = [], []
+    wire(gazekey, shown, calibrated)
+    gazekey.run_setup_check()
+    shown[0].finished.emit(None)
+
+    assert calibrated == [], "Esc at the check must not start calibrating"
+    assert gazekey.exit_code == 1 and gazekey.app.quit_calls == 1
+
+
+def test_a_failed_but_overridden_check_still_calibrates(gazekey, staged, capsys):
+    shown, calibrated = [], []
+    wire(gazekey, shown, calibrated)
+    gazekey.run_setup_check()
+
+    failed = _failing_result()
+    shown[0].finished.emit(failed)
+    assert calibrated == [True], "continuing anyway must actually continue"
+    assert "WARNING" in capsys.readouterr().out
+
+
+def _passing_result():
+    from gaze.setup_check import SetupCheckResult
+
+    return SetupCheckResult(hy_span=0.051, min_hy_span=0.035)
+
+
+def _failing_result():
+    from gaze.setup_check import SetupCheckResult, SetupFailure
+
+    return SetupCheckResult(hy_span=0.024, min_hy_span=0.035,
+                            failure=SetupFailure.LOW_SPAN, overridden=True)
 
 
 # ------------------------------------------------------------ the exit banner

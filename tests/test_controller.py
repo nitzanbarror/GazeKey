@@ -113,10 +113,10 @@ def test_dwell_time_is_configurable(keyboard):
 def test_focus_survives_a_wobble_into_the_margin(controller, keyboard):
     """A focused key keeps focus inside its 25% margin (spec Section 7).
 
-    The grid is gapless, so between two letters the neighbour always wins (it
-    owns that point outright). The margin is what protects the board's outer
-    edge and the non-selectable suggestion strip above the top row — exactly
-    where a slightly-off prediction would otherwise drop the dwell.
+    The margin protects the board's outer edge and the non-selectable
+    suggestion strip above the top row — and, since NFR-7, the strip of the
+    *neighbouring key* it overlaps as well: hit regions are gapless, so asking
+    the neighbours first is what made the margin inert between keys.
     """
     key = key_of(keyboard, "key.A")
     x, y, w, h = key.rect
@@ -129,7 +129,21 @@ def test_focus_survives_a_wobble_into_the_margin(controller, keyboard):
     assert controller.progress > progress, "dwell should keep advancing"
 
 
-def test_a_neighbour_steals_focus_from_its_own_region(controller, keyboard):
+def test_focus_survives_a_wobble_into_a_neighbouring_key(controller, keyboard):
+    """The NFR-7 fix: the grown region wins against a neighbour too."""
+    key = key_of(keyboard, "key.A")
+    x, y, w, h = key.rect
+    stare(controller, key.centre, 0.5)
+    progress = controller.progress
+
+    just_inside_next = (x + w * 1.10, y + h / 2)    # 10% into the key to its right
+    stare(controller, just_inside_next, 0.2, start=0.5)
+    assert controller.focused_key.id == "key.A", "the neighbour stole a wobble"
+    assert controller.progress > progress, "dwell should keep advancing"
+
+
+def test_a_neighbour_steals_focus_from_outside_the_grown_region(controller,
+                                                                keyboard):
     left = key_of(keyboard, "key.A")
     right = key_of(keyboard, "key.B")
     stare(controller, left.centre, 0.5)
@@ -138,6 +152,20 @@ def test_a_neighbour_steals_focus_from_its_own_region(controller, keyboard):
     stare(controller, right.centre, 0.1, start=0.5)
     assert controller.focused_key.id == right.id, "neighbour never took focus"
     assert controller.progress < 0.2, "dwell must restart on the new key"
+
+
+def test_a_stolen_dwell_decays_instead_of_vanishing(controller, keyboard):
+    """Spec Section 7: a steal costs grace, not the whole dwell."""
+    left = key_of(keyboard, "key.A")
+    right = key_of(keyboard, "key.B")
+    stare(controller, left.centre, 0.6)
+    before = controller.progress
+
+    stare(controller, right.centre, 0.1, start=0.6)       # half of the grace
+    fired, _ = stare(controller, left.centre, 0.8, start=0.7)
+    assert len(fired) == 1 and fired[0].key.id == left.id, \
+        "the interrupted dwell should have resumed, not restarted"
+    assert before > 0.5
 
 
 def test_hysteresis_margin_is_configurable(keyboard):

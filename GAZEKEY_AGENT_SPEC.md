@@ -16,10 +16,14 @@ minute and was unusable. Follow the calibration design in Section 5 exactly; do
 not simplify it.
 
 **Status (2026-08-08): Milestones 1–5 are complete, plus word prediction pulled
-forward from M6, region-scoped calibration (Section 5.6) and point-level
-calibration repair (Section 5.3). 605 tests passing.**
-Typing stability is diagnosed but **not fixed** — see NFR-7. Remaining scope: M6 (Hebrew + RTL only),
-then the two end-to-end scenarios in Section 11.
+forward from M6, region-scoped calibration (Section 5.6), point-level
+calibration repair (Section 5.3), the typing-stability fixes of NFR-7 (sticky
+focus and a dwell that survives a steal) and the setup check of Section 5.1c.
+649 tests passing.**
+The NFR-7 fixes are implemented and tested but **not yet measured on hardware**
+— the after-measurement with `--debug-typing` is the next thing to do.
+Remaining scope: M6 (Hebrew + RTL only), then the two end-to-end scenarios in
+Section 11.
 
 > **Where this document and the code disagree, what to do depends on the kind
 > of disagreement** (CLAUDE.md rule 9):
@@ -78,6 +82,7 @@ gaze/                    VERIFIED CORE plus what wraps it
   calibration_session.py session sequencing over that core (no math of its own)
   drift.py               DriftMonitor + TouchUpSession (M5)
   region.py              the calibration region + its persistence
+  setup_check.py         the 5 s pre-calibration camera check (5.1c)
 interaction/
   controller.py          dwell state machine, hysteresis, hit-testing
   layouts.py             key geometry, NFR-2 sizing, layout selection
@@ -90,6 +95,7 @@ ui/
   overlay.py             frameless always-on-top click-through keyboard window
   keyboard_widget.py     key rendering, dwell feedback, suggestions, self-view
   calibration_screen.py  fullscreen calibration & validation UI
+  setup_check_screen.py  the two-target camera check before it (5.1c)
   practice_screen.py     the aiming drill
   touchup_screen.py      the single-target "Fix aim" screen (M5)
   choice_screen.py       gaze-answerable questions (the Quit confirmation)
@@ -195,6 +201,48 @@ valid frames, or < 6° of range on both axes) — the UI must then explain why a
 repeat the step. Selected by `calibrate.py --with-head-sweep`, or
 `fixed_head: false` in config (which `main.py` also honours).
 
+### 5.1c The setup check — five seconds before the nine dots
+
+**A bad sitting is visible before calibration and invisible during it.** When
+the camera sits below eye height the eyelids crop the iris, the vertical iris
+ratio barely moves between the top and the bottom of the screen, and the fit
+has almost no vertical signal to work with. The user finds this out forty
+seconds later as a MARGINAL verdict they cannot interpret — it just feels like
+the app is bad. Two measured sittings on the development machine:
+
+| sitting | hy span | calibration |
+|---|---|---|
+| camera at eye height | **0.051** | PASS 44.3 px |
+| camera below eye height | **0.024** | MARGINAL 117.5 px, 0 keys typed in 47 s |
+
+So `python main.py` measures that number **first**, in about five seconds
+(`gaze/setup_check.py`, `ui/setup_check_screen.py`):
+
+1. Two still targets in the same visual language as calibration — a neutral dot
+   with a thin ring filling around it — at the **top and bottom centre of the
+   calibration region**, at exactly the 10% and 90% heights the 3×3 grid uses,
+   so the number is directly comparable with the `hy span` printed after a
+   session. 500 ms settle, then 30 valid samples or 2.0 s per target.
+2. The **median** hy at each; the span between them is the measurement.
+3. Below `setup_check_min_hy_span` (**0.035**, between the two measured
+   sittings and deliberately nearer the bad one) the screen says
+   **"Camera looks too low — raise the laptop so the camera is at eye height"**
+   and shows the measurement. Fewer than 10 usable samples on either target is
+   reported differently — that is lighting or distance, not camera height.
+4. **It never blocks.** Space re-runs the check, Enter calibrates anyway (and
+   the console says the result was overridden), Esc quits. A passing check shows
+   no screen at all: it prints the span and goes straight to the dots.
+5. The measured span is printed **either way**, pass or fail.
+6. `--skip-setup-check` skips it entirely.
+
+**Answered from the keyboard, not by gaze, and therefore startup-only — a
+product rule** (approved 2026-08-08; CLAUDE.md rule 9 applies). There is no
+calibration yet, so nothing on screen could be aimed at reliably, and the fix
+being asked for needs a pair of hands anyway. It follows that the check must
+**never** be put in front of the in-session `Recal.` key: a gaze-only user
+mid-session could not answer a keyboard-rendered screen, and would be trapped
+between a keyboard they cannot use and a check they cannot dismiss.
+
 **Stage B — 9-point mapping (both modes):** pose-compensated ratios
 `(hx_c, hy_c)` are mapped to screen pixels by ridge-regularized 2nd-order
 polynomial regression per axis:
@@ -208,8 +256,10 @@ Features are standardized with std floors and clamped to ±3σ at prediction tim
 
 ### 5.2 Calibration session UI flow
 
-0. **Head-sweep screen** — free-head mode only (Section 5.1b). Skipped entirely
-   in the default fixed-head mode.
+0. **Setup check** — the two-target camera check of Section 5.1c, at startup,
+   unless `--skip-setup-check`.
+0b. **Head-sweep screen** — free-head mode only (Section 5.1b). Skipped
+   entirely in the default fixed-head mode.
 1. Fullscreen dark screen. **9 targets, one at a time**, on a 3×3 grid at
    10%/50%/90% of the **calibration region** (Section 5.6), in randomized
    order. With `--cal-region full` the region is the whole display and this is
@@ -487,24 +537,49 @@ State machine per focused key: `IDLE → FOCUS → DWELLING → ACTIVATED`.
 
 - Dwell threshold: config, default **1.0 s** (allowed 0.5–2.0).
 - Dwell advances **only while `is_fixating` is true** and gaze is inside the key.
-- **Hysteresis:** once a key is focused its hit region grows by 25% on each
-  side; a new key only steals focus if gaze enters *its* unexpanded region.
+- **Hysteresis — sticky focus.** Once a key is focused its hit region grows by
+  25% on each side, and **the focused key is asked first**: it keeps the point
+  anywhere inside that grown region, so a challenger has to win the point from
+  *outside* it.
 
-  > **This rule is self-defeating as specified, and measured to be inert.**
-  > Hit regions are gapless, so inside the board *some* key's unexpanded region
-  > always contains the point and the challenger wins outright; the focused
-  > key's grown region is only ever consulted off the board. Ownership around a
-  > focused key is byte-identical at margins 0.0, 0.25, 0.45 and 0.90
-  > (`test_hysteresis_does_nothing_between_keys`). What the margin really buys
-  > is the board's outer edge and the non-selectable strips. Making it act
-  > between keys means changing the rule — see NFR-7 below.
+  > This is what the rule always meant, but not what it used to do. Hit regions
+  > are gapless, so asking the challengers first meant one of them always owned
+  > the point inside the board and the margin was measurably inert between keys
+  > — ownership was byte-identical at margins 0.0, 0.25, 0.45 and 0.90. Asking
+  > the incumbent first is the whole fix (NFR-7, adopted).
 
-- **A focus steal discards the dwell instantly**, with no grace: `_decay` is
-  only reached when the gaze leaves *every* key. One frame of gaze crossing a
-  row boundary throws away however much dwell had accumulated. On a 93 px row
-  a 47 px wobble is enough, which is the reported H↔N↔Y flapping.
-- **Grace period:** on leaving the region the accumulated dwell decays over
-  200 ms instead of resetting instantly.
+- **A key always owns its core — a product rule, not a tuning detail.**
+  (Approved 2026-08-08; changing it needs the owner, per CLAUDE.md rule 9.)
+  The core is the middle of a key left when a fixed fraction (`CORE_MARGIN`,
+  0.25) is taken off each side, and it belongs to that key **whatever the
+  hysteresis margin is set to** — including any future per-axis margin. The
+  margin is a fraction of the *focused* key's size, and Space is 250 px against
+  the 124 px Backspace beside it: unbounded, a focused Space reaches past
+  Backspace's centre and Backspace becomes unselectable. The guarantee, stated
+  plainly: **hysteresis can never cost the user a key they are looking straight
+  at.** No stickiness rule may be added that weakens it.
+
+- **Grace period — a dwell survives losing its key.** Accumulated dwell decays
+  linearly over 200 ms rather than being thrown away, and coming back inside
+  that window resumes it where it left off. This applies to **both** ways a key
+  can be lost:
+  - the gaze left every key (the original path), and
+  - **a neighbour took focus.** The interrupted dwell is *carried*: the new key
+    starts its own dwell at zero while the old key's decays in the background,
+    and returning to it restores whatever is left. One jittered frame across a
+    row boundary therefore costs one frame of decay instead of the whole
+    second, which is the reported H↔N↔Y flapping.
+
+  There is **one carry slot**: a second steal replaces it, so a wander across
+  three keys keeps only the most recent — the one the gaze is most likely to
+  return to. `grace_period_ms: 0` reproduces the old discard-on-steal rule
+  exactly.
+
+- **The counts say which of those happened.** A steal is recorded as
+  `focus_stolen` only when its carried dwell expires; one that comes back in
+  time is `focus_recovered` and costs nothing. Counting the steal at the moment
+  it happened would report a loss that did not occur and hide the mechanism
+  that prevented it.
 - **Refractory period:** 400 ms after activation during which the same key
   cannot re-activate.
 - **Extended dwell 2.0 s** on the modal and destructive keys:
@@ -643,6 +718,7 @@ keys are ignored, so an old or partial file never breaks startup.
   "keyboard_height_ratio": 0.6666666666666666,
   "show_webcam_preview": true,
   "fixed_head": true,
+  "setup_check_min_hy_span": 0.035,
   "calibration_settle_ms": 700,
   "calibration_collect_samples": 45,
   "calibration_collect_max_s": 4.0,
@@ -655,7 +731,8 @@ keys are ignored, so an old or partial file never breaks startup.
 ```
 
 `drift_offset_px: 0` means "derive the drift threshold from the measured
-calibration error" (Section 5.5.1).
+calibration error" (Section 5.5.1). `setup_check_min_hy_span` is the gate in
+Section 5.1c; `--skip-setup-check` bypasses it for one run.
 
 ## 11. Build order — milestones
 
@@ -668,6 +745,8 @@ calibration error" (Section 5.5.1).
 | M5 | drift monitor + 1-point touch-up + in-place recalibration + PAUSE/RECALIBRATE keys | **done** |
 | — | region-scoped calibration (Section 5.6), practice made opt-in | **done** |
 | — | point-level calibration repair (Section 5.3) | **done** |
+| — | typing stability: sticky focus + dwell survives a steal (NFR-7) | **done, awaiting the after-measurement** |
+| — | the 5-second setup check before calibration (Section 5.1c) | **done** |
 | M6 | **Hebrew layout + RTL only** | next |
 
 Word prediction was pulled forward out of M6 and is done (Section 8.4), so M6
@@ -693,7 +772,15 @@ checkpoint, before the next one starts.
 - `test_drift.py` / `test_touchup.py` — the M5 core, driven from explicit
   timestamps so the 3 s and 60 s boundaries are tested at their real values.
 - `test_typing_diagnostics.py` — the tuning-knob precedence (flag > config >
-  default), the dwell-loss accounting, and the two knobs measured to be inert.
+  default), the dwell-loss accounting, and what each knob now does: the margin
+  changes ownership between keys, one jittered frame does not zero the dwell,
+  the decay follows `grace-ms`, a key always owns its core, and the refractory
+  is unaffected by a carried dwell.
+- `test_setup_check.py` / `test_setup_check_ui.py` — the gate of Section 5.1c:
+  the two measured sittings land either side of the threshold, the targets sit
+  on the calibration rows and inside the region, too few samples fail
+  differently from a low span, a retry measures from scratch, and continuing
+  anyway is recorded rather than hidden.
 - `test_region.py` — region geometry, target placement, persistence, and that
   every gaze-selectable target (keys, the Quit boxes, the Fix aim dot, the
   drill) lands inside the calibrated area.
@@ -791,21 +878,46 @@ layout that actually complies at realistic webcam accuracy.
 size and the verdict, shows `keys below spec: …` in the corner with both axes,
 and names what would fix it.
 
-### NFR-7 — Typing stability (open; diagnosed, not yet fixed)
+### NFR-7 — Typing stability (fixes 1 and 2 adopted; 3 deferred)
 
 A dwell that never completes is as unusable as a bad calibration. The keyboard
 must let a user hold a key through the residual wobble of their own gaze.
 
-**Measured state.** With a 44.3 px in-region calibration and 93 px rows, a
-single frame of vertical jitter steals focus and discards the whole
-accumulated dwell. Of the three tuning knobs, **two cannot affect this at
-all**: hysteresis is inert between keys (Section 7) and grace is never reached
-on a steal. Only `--min-cutoff` bites, by reducing the wobble itself.
+**What was measured.** With a 44.3 px in-region calibration and 93 px rows, a
+single frame of vertical jitter stole focus and discarded the whole accumulated
+dwell. Of the three tuning knobs, **two could not affect this at all**:
+hysteresis was inert between keys and grace was never reached on a steal. Only
+`--min-cutoff` bit, by reducing the wobble itself. A second session on a worse
+sitting (117.5 px, hy span 0.024) recorded the extreme: **0 keys activated in
+47 s across 40 dwell attempts** — 18 steals, 13 fixation drops, 9 grace
+expiries, focus changing 3.7×/s, jitter x 34 y 152 px.
 
-`--debug-typing` measures which of the three failure modes is actually in play:
+**Adopted (both are Section 7 conformance, not new behaviour — the spec always
+said the focused key's grown region keeps ownership, and that dwell decays over
+the grace rather than resetting):**
+
+1. **Sticky focus** — the focused key is asked first, so its grown region
+   actually decides ownership and `--hysteresis` is live. Bounded by
+   `CORE_MARGIN` so a wide key can never swallow a narrow neighbour (Section 7).
+2. **The dwell survives a steal** — it is carried and decays over the grace
+   instead of being zeroed, making `--grace-ms` live. A steal counts as a loss
+   only if the gaze does not come back in time; one that does is reported as
+   `saved`/`recovered`.
+
+Defaults are unchanged: margin 0.25, grace 200 ms.
+
+**Deferred pending the after-measurement:**
+
+3. **Per-axis hysteresis** — rows are 93 px and columns 124–137 px, and the
+   vertical jitter is the larger, so a separate vertical margin targets the axis
+   that actually fails. Not adopted: 1 and 2 may already cover it, and a second
+   axis-specific knob is only worth its complexity if the measurement still
+   shows steals dominating.
+
+`--debug-typing` measures which of the failure modes is in play:
 
 ```
-[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0
+[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0  saved 3
                 jitter x   6 y  45 px  spread x 201 y  69  fixating 100%  keys 0
 ```
 
@@ -815,17 +927,18 @@ between keys and reads ~350 px on x while the real wobble is 6 px. Read it
 against the key size: jitter approaching a quarter of a key crosses boundaries
 routinely.
 
-**Candidate fixes, none adopted yet** (each is a product decision):
+**What a healthy session looks like after 1 and 2** — the bar the
+after-measurement is read against:
 
-1. **Sticky focus** — the focused key keeps ownership while the gaze is inside
-   its *grown* region, and a challenger must win outside it. This is what the
-   hysteresis margin was always meant to do, and it makes the existing knob
-   live. One line in `_hit_test`.
-2. **Carry the dwell across a steal** — apply the grace decay instead of
-   zeroing, making `--grace-ms` live.
-3. **Per-axis hysteresis** — rows are 93 px and columns 124–137 px, and the
-   vertical jitter is the larger, so a separate vertical margin targets the
-   axis that actually fails.
+| number | healthy | what it means if it is not |
+|---|---|---|
+| `keys` per dwell attempt | **≥ 90%** | dwells are completing |
+| `steal` | low, and **fewer than `saved`** | the carry is doing its job; if steals still dominate, fix 3 |
+| `fixdrop` | near zero | otherwise raise `fixation_dispersion_px` |
+| `grace` | near zero | otherwise the gaze is leaving the board entirely — calibration, not interaction |
+| `focus` changes | **< ~1.5/s** while typing | 3–4/s is flapping between neighbours |
+| `jitter y` | **< ~23 px** (a quarter of a 93 px row) | above it, boundary crossings are routine |
+| `fixating` duty | **> 60%** | below it the detector, not the keyboard, is the limit |
 
 ### NFR-3 — Robustness
 No crash when the camera is unplugged or held by another app. The overlay never

@@ -3,10 +3,12 @@
 When typing is unstable the symptom is always the same — "it won't select" —
 but the causes are not, and they need different fixes:
 
-* **gaze jitter** crossing a key boundary steals focus and discards the dwell.
-  Shows up as a high per-axis ``jitter`` against the key size, and as ``steal``
-  dominating the loss counts. The fix is smoothing (``--min-cutoff``) or
-  stickier focus;
+* **gaze jitter** crossing a key boundary steals focus. The dwell survives if
+  the gaze comes back inside the grace (counted as ``saved``) and is lost
+  otherwise. Shows up as a high per-axis ``jitter`` against the key size, and
+  as ``steal`` dominating the loss counts. The fixes are smoothing
+  (``--min-cutoff``), a wider sticky region (``--hysteresis``) and a longer
+  grace (``--grace-ms``);
 * **the fixation detector letting go** mid-dwell stalls progress without moving
   focus. Shows up as ``fixdrop`` and a low duty cycle. The fix is the
   dispersion threshold;
@@ -104,7 +106,8 @@ class Window:
             f"focus {self.focus_rate:4.1f}/s  "
             f"resets: steal {self.dwell.focus_stolen:<3d} "
             f"fixdrop {self.dwell.fixation_dropped:<3d} "
-            f"grace {self.dwell.grace_expired:<3d}  "
+            f"grace {self.dwell.grace_expired:<3d} "
+            f"saved {self.dwell.focus_recovered:<3d}  "
             f"jitter x {_px(jitter_x):>3} y {_px(jitter_y):>3} px  "
             f"spread x {_px(_std(self.xs)):>4} y {_px(_std(self.ys)):>4}  "
             f"fixating {'-' if duty != duty else f'{duty * 100:.0f}%'}  "
@@ -206,6 +209,8 @@ class TypingDiagnostics:
             f"focus stolen {dwell.focus_stolen}, "
             f"fixation dropped {dwell.fixation_dropped}, "
             f"grace expired {dwell.grace_expired}",
+            f"  dwells recovered: {dwell.focus_recovered} "
+            f"(focus was stolen and the gaze came back inside the grace)",
             f"  focus changes   : {dwell.focus_changes} "
             f"({session.focus_rate:.1f}/s)",
             f"  jitter          : x {_px(session.jitter[0])} px, "
@@ -250,8 +255,9 @@ class TypingDiagnostics:
                             f"{hold_x:.0f} px against a {key_w:.0f} px column, "
                             f"versus y {hold_y:.0f} px against {key_h:.0f} px.")
             return (f"{share:.0f}% of lost dwells were focus steals - gaze is "
-                    f"crossing key boundaries mid-dwell.{axis} Try a lower "
-                    f"--min-cutoff (more smoothing).")
+                    f"crossing key boundaries mid-dwell and not coming back in "
+                    f"time.{axis} Try a wider --hysteresis, a longer "
+                    f"--grace-ms, or a lower --min-cutoff (more smoothing).")
 
         if losses and dwell.fixation_dropped >= 0.6 * losses:
             return ("most dwells died because the fixation detector let go, "

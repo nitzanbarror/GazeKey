@@ -28,6 +28,11 @@ DEFAULTS: Dict[str, Any] = {
     # for the target users): pose is constant, so the head-sweep stage is
     # skipped and pose-compensation sensitivities stay at zero.
     "fixed_head": True,
+    # the 5-second setup check before the nine dots (spec 5.1c): how far the
+    # vertical iris ratio must travel between the top and bottom of the
+    # calibration region before calibrating is worth the user's time. Measured
+    # sittings: 0.051 good, 0.024 with the camera below eye height.
+    "setup_check_min_hy_span": 0.035,
     # calibration pacing — how long each target waits before collecting, how
     # many valid samples it wants, and the wall-clock cap per target
     "calibration_settle_ms": 700,

@@ -28,6 +28,8 @@ GazeKey: a desktop virtual keyboard controlled by eye gaze via a standard webcam
 - M4: Keyboard overlay + dwell state machine + keystroke injection — **done**
 - M5: Drift monitor + 1-point touch-up ("Fix aim") + in-place recalibration + PAUSE/RECALIBRATE keys — **done**
 - Region-scoped calibration (spec 5.6) + practice made opt-in — **done**. `python main.py` is calibrate → keyboard; the nine dots span the keyboard area rather than the whole screen, so the measured error is an in-region error and NFR-2 is judged against it. `--practice` runs the drill, `--cal-region full` restores whole-screen calibration for comparison.
+- Typing stability (spec NFR-7) — **done, awaiting the after-measurement.** Sticky focus (the focused key's grown region really does decide ownership, bounded so a wide key cannot swallow a narrow neighbour) and a dwell that survives a steal by decaying over the grace instead of being zeroed. Both defaults unchanged (margin 0.25, grace 200 ms). Proposal 3 (per-axis hysteresis) is deferred until the measurement says whether it is still needed.
+- The 5-second setup check before calibration (spec 5.1c) — **done**. Two dots measure the hy span; below 0.035 it says the camera is too low and offers a retry, calibrate-anyway, or quit. `--skip-setup-check` turns it off.
 - M6: **Hebrew layout + RTL only** — next. (Word prediction was pulled forward and is already done, so it is not part of M6; Hebrew prediction is the same mechanism with a Hebrew frequency list if feasible, otherwise gracefully absent.)
 - Then the two end-to-end scenarios, by gaze only: type "Hi" into WhatsApp Web, and "Dog" into a Google search box.
 
