@@ -51,10 +51,15 @@ class SetupCheckScreen(QWidget):
         parent: Optional[QWidget] = None,
         tick_ms: int = 16,
         log: Optional[Callable[[str], None]] = None,
+        intro: Optional[Tuple[str, str]] = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.pipeline = pipeline
+        #: ``(kicker, headline)`` for the lead-in, so ``--feature-lab`` can
+        #: borrow this screen without claiming to be the camera check
+        self.intro = intro or ("Quick camera check",
+                               "Two dots are about to appear")
         self.log = log if log is not None else (
             lambda message: print(f"[GazeKey] {message}"))
         self._emitted = False
@@ -84,6 +89,7 @@ class SetupCheckScreen(QWidget):
                 self._primed = True
                 samples = []
             for sample in samples:
+                self.session.observe(sample)
                 result = self.session.update(sample.features)
                 if result is not None:
                     self.log(result.console_line())
@@ -131,8 +137,8 @@ class SetupCheckScreen(QWidget):
         came to report a span four times too small.
         """
         return [
-            ("Quick camera check", 0.20, 24, DIM),
-            ("Two dots are about to appear", 0.26, 40, TEXT),
+            (self.intro[0], 0.20, 24, DIM),
+            (self.intro[1], 0.26, 40, TEXT),
             ("Look straight at each one and hold. It takes about "
              f"{self.session.typical_s:.0f} seconds, and checks that the camera "
              "can see your eyes move up and down.", 0.36, 28, TEXT),

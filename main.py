@@ -43,6 +43,7 @@ from config import (
 from gaze.calibration import CalibrationModel
 from gaze.calibration_session import CalibrationSession
 from gaze.drift import DriftMonitor, TouchUpSession
+from gaze.feature_lab import FeatureLabSession
 from gaze.region import attach_region, full_screen_region, read_region
 from gaze.setup_check import MIN_HY_SPAN, SetupCheckSession
 from interaction.controller import DwellController, DwellSettings
@@ -170,6 +171,9 @@ class GazeKeyApp:
         self.predictor = WordPredictor(path=user_words_path())
         self.injector = make_injector()
 
+        if self.args.feature_lab:
+            self.run_feature_lab()         # diagnostic: measure, print, quit
+            return None
         self._start_calibration_or_saved()
         return None                        # the event loop takes over
 
@@ -193,6 +197,38 @@ class GazeKeyApp:
             print("[GazeKey] --use-saved: nothing stored for this screen and "
                   "camera - calibrating.")
         self.run_setup_check()
+
+    # -------------------------------------------------- the feature lab (R/O)
+    def run_feature_lab(self) -> None:
+        """``--feature-lab``: measure four vertical features at once, then quit.
+
+        Read-only and diagnostic. Nothing is fitted, saved or changed; the only
+        output is a table on the console. It borrows the setup check's protocol
+        and pacing deliberately — a diagnostic that measured before the user's
+        eyes arrived would repeat the very bug that prompted it.
+        """
+        session = FeatureLabSession(self.screen_size, region=self.region,
+                                    seconds=float(self.args.seconds))
+        self.pipeline.landmarks_enabled = True      # off for every other run
+        print(f"[GazeKey] feature-lab: {session.cycles} cycle(s) of two dots, "
+              f"~{session.typical_s:.0f} s. Read-only - nothing is calibrated "
+              f"or saved.")
+        screen = SetupCheckScreen(
+            session, self.pipeline,
+            intro=("Feature lab (diagnostic)",
+                   "Dots will alternate top and bottom"))
+
+        def finished(result) -> None:
+            self.pipeline.landmarks_enabled = False
+            if result is None:
+                print("[GazeKey] feature-lab cancelled.")
+            elif session.report is not None:
+                for line in session.report.lines():
+                    print(line)
+            self.request_quit()
+
+        screen.finished.connect(finished)
+        self._show(screen)
 
     # ------------------------------------------------------- the setup check
     def run_setup_check(self) -> None:
@@ -563,6 +599,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "keyboard (opt-in; the default goes straight to "
                              "typing)")
     parser.add_argument("--practice-targets", type=int, default=10)
+    parser.add_argument("--feature-lab", action="store_true",
+                        help="DIAGNOSTIC (read-only): run the two-dot protocol "
+                             "and report four candidate vertical features side "
+                             "by side, with span and span/IQR for each, then "
+                             "quit. Nothing is calibrated or saved.")
+    parser.add_argument("--seconds", type=float, default=12.0, metavar="N",
+                        help="how long --feature-lab alternates the two dots "
+                             "(default 12 s, about two cycles); longer is a "
+                             "steadier estimate")
     parser.add_argument("--skip-setup-check", action="store_true",
                         help="skip the 5-second camera check before the nine "
                              "dots (it measures whether the camera can see "

@@ -57,6 +57,17 @@ class GazeSample:
     is_fixating: bool = False
     stream_valid: bool = False
     held: bool = False               # x/y carried over from before a blink
+    #: (478, 2) landmarks in **pixels**, and only when a caller has asked for
+    #: them (``GazePipeline.landmarks_enabled``). Off by default: nothing in
+    #: the app needs them, and an array per frame on every sample is waste.
+    #: In memory only, like every other frame-derived thing here (NFR-4).
+    #:
+    #: Pixels rather than the normalised coordinates, because normalised x and
+    #: y are divided by *different* numbers (640 and 480 here): any measurement
+    #: that mixes the two axes — a distance, an angle, a perpendicular — is
+    #: wrong in that space. The verified ``hx``/``hy`` are unaffected, being
+    #: ratios within one axis.
+    landmarks_px: Optional[np.ndarray] = None
 
     @property
     def valid(self) -> bool:
@@ -119,6 +130,9 @@ class GazePipeline:
         self._preview_lock = threading.Lock()
         self._preview: Optional[np.ndarray] = None
         self.preview_enabled = False
+        #: attach per-frame landmarks to each sample — see GazeSample. Only the
+        #: --feature-lab diagnostic turns this on.
+        self.landmarks_enabled = False
         self._camera: Optional[CameraSource] = None
         self._tracker: Optional[FaceTracker] = None
         self._thread: Optional[threading.Thread] = None
@@ -306,7 +320,10 @@ class GazePipeline:
                 else:
                     state = STATE_NO_FACE
 
-                self._queue.put(self.track(features, state))
+                sample = self.track(features, state)
+                if self.landmarks_enabled:
+                    sample.landmarks_px = result.landmarks_px
+                self._queue.put(sample)
 
                 now = time.time()
                 dt = now - last

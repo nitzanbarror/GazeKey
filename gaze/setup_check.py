@@ -283,6 +283,15 @@ class SetupCheckSession:
             samples=len(self._samples),
         )
 
+    def observe(self, sample) -> None:
+        """See the whole gaze sample, before :meth:`update` gets its features.
+
+        A no-op here — the check needs nothing but ``hy``. ``--feature-lab``
+        overrides it to take the frame's landmarks, which is the only thing
+        that cannot be recovered from :class:`~gaze.features.FrameFeatures`
+        after the fact.
+        """
+
     def update(self, features: FrameFeatures) -> Optional[SetupCheckResult]:
         """Consume one frame; returns the result on the frame it completes."""
         if self.is_finished:

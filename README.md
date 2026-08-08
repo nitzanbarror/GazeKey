@@ -207,6 +207,55 @@ A healthy session has `keys` ≈ 90% of dwell attempts, `steal` low and below
 `saved`, `fixdrop` and `grace` near zero, `focus` under ~1.5/s, and `jitter y`
 under about a quarter of the row height.
 
+## The vertical channel — `--feature-lab`
+
+```bash
+python main.py --feature-lab --seconds 20
+```
+
+**Read-only diagnostic.** Nothing is calibrated, fitted or saved; it runs the
+two-dot protocol, prints a table and quits.
+
+Every sitting shows the same asymmetry: `hx` spans 0.13–0.22 across the
+calibration region while `hy` spans only 0.02–0.06. The vertical channel
+carries about a fifth of the horizontal one's signal — and vertical is the axis
+NFR-2 binds on. The suspicion is that this is baked into the feature
+definitions: `hx` is referenced to the **eye corners** (as good as skull-fixed)
+while `hy` is referenced to the **eyelids**, which follow vertical gaze at
+85–90% and so chase the very thing they are meant to measure.
+
+The lab computes four vertical features from the *same* frames:
+
+| | candidate | origin | scale |
+|---|---|---|---|
+| a | `hy` — the baseline, straight from the verified core | upper lid | lid-to-lid (moves) |
+| b | iris against the inter-corner line | corners | inter-corner (fixed) |
+| c | lid aperture | — | inter-corner (fixed) |
+| d | upper lid to iris | upper lid | inter-corner (fixed) |
+
+```
+[feature-lab] vertical feature comparison - 3 cycle(s), 6 visit(s), 180 samples
+  candidate                        top      bottom      span       IQR   span/IQR   vs base
+  hy  (baseline, verified core)    0.4509    0.5505    0.0995    0.0110       9.0       -
+  iris vs corner line / width     -0.1199    0.1194    0.2394    0.0031      78.0     8.64x
+  lid aperture / width             0.2996    0.2992    0.0005    0.0053       0.1     0.01x
+  upper lid to iris / width        0.1353    0.1642    0.0289    0.0045       6.5     0.72x
+  reading       : b_corner carries 8.6x the baseline's signal-to-noise ...
+```
+
+**Read the `span/IQR` column, not `span`.** Each candidate divides by a
+different length, so raw spans are in different units — a bigger span can mean
+nothing more than a smaller denominator. The table is a diagnosis, not a race:
+*b ≫ a* means the reference is the problem; *d ≈ a* means the numerator is;
+*c* moving at all is the mechanism (the lid really does track gaze).
+
+Spec Appendix B has the analysis, including what MediaPipe hands us that we
+currently discard — blendshapes (`eyeLookUp/Down`), the iris ring's extent as a
+distance-invariant normaliser, and the facial transformation matrix. Changing
+the feature would touch the verified core, so it is a rule-9 product decision:
+evidence first, then approval, then re-verification of the whole calibration
+suite.
+
 ## Word prediction
 
 Local, instant and offline (spec NFR-5) — nothing about what is typed leaves the

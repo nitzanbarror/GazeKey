@@ -19,7 +19,7 @@ not simplify it.
 forward from M6, region-scoped calibration (Section 5.6), point-level
 calibration repair (Section 5.3), the typing-stability fixes of NFR-7 (sticky
 focus and a dwell that survives a steal) and the setup check of Section 5.1c.
-660 tests passing.**
+689 tests passing.**
 The NFR-7 fixes are implemented and tested but **not yet measured on hardware**
 — the after-measurement with `--debug-typing` is the next thing to do.
 Remaining scope: M6 (Hebrew + RTL only), then the two end-to-end scenarios in
@@ -83,6 +83,7 @@ gaze/                    VERIFIED CORE plus what wraps it
   drift.py               DriftMonitor + TouchUpSession (M5)
   region.py              the calibration region + its persistence
   setup_check.py         the 5 s pre-calibration camera check (5.1c)
+  feature_lab.py         --feature-lab: vertical-feature diagnostic (Appendix B)
 interaction/
   controller.py          dwell state machine, hysteresis, hit-testing
   layouts.py             key geometry, NFR-2 sizing, layout selection
@@ -823,6 +824,11 @@ checkpoint, before the next one starts.
   feeds no target, a stale backlog cannot spend one, and **the painted dots
   land on the calibration grid's extreme rows in screen pixels** at full
   resolution.
+- `test_feature_lab.py` — the vertical-channel diagnostic (Appendix B), driven
+  by a synthetic eye whose **eyelid chases the iris** at a settable fraction:
+  a chasing lid guts `hy` while the corner-referenced candidate is untouched,
+  raw spans are not comparable between candidates, `d` isolates the
+  denominator, and the lab never fits, saves or blocks anything.
 - `test_region.py` — region geometry, target placement, persistence, and that
   every gaze-selectable target (keys, the Quit boxes, the Fix aim dot, the
   drill) lands inside the calibrated area.
@@ -1028,6 +1034,61 @@ User's historical best calibration: **81 px**; typical **85–95 px**. **Vertica
 error tends to exceed horizontal** — which is exactly why NFR-2 is evaluated on
 the minimum key dimension and why the height axis is the one that binds on this
 screen.
+
+---
+
+## Appendix B — the vertical channel (investigation, no product change)
+
+`hx` spans 0.13–0.22 across the calibration region; `hy` spans 0.02–0.06. The
+vertical channel carries roughly a fifth of the horizontal one's signal, and
+that is the ceiling on vertical accuracy — which is also the axis NFR-2 binds
+on. `--feature-lab` (`gaze/feature_lab.py`, read-only) measures four candidate
+vertical features from the same frames over the two-dot protocol and reports
+span, within-target IQR and **span/IQR** for each.
+
+**The hypothesis being tested.** The asymmetry looks baked into the feature
+definitions (Section 4, verified core): `hx` is referenced to the **eye
+corners**, which are as good as skull-fixed, while `hy` is referenced to the
+**eyelids**, which follow vertical gaze at ~85–90% — so both its origin and its
+scale chase the iris, and a ratio whose reference moves with its subject
+reports almost nothing. The candidates are a 2×2 of that claim: **a** `hy`
+(lid origin, lid scale), **b** iris against the inter-corner line over
+inter-corner distance (corner, corner), **c** lid aperture over eye width (the
+mechanism check), **d** upper-lid-to-iris over eye width (lid origin, fixed
+scale).
+
+Two things learned building it, both worth keeping:
+
+* **Only `span/IQR` is comparable across candidates.** Each divides by a
+  different length — the baseline by the ~19 px lid aperture, the rest by the
+  ~64 px eye width — so raw spans are in different units and ranking them
+  compares denominators, not signal.
+* **Work in pixels, never in normalised coordinates.** Normalised x and y are
+  divided by different numbers (640 and 480), so anything mixing the two axes
+  is distorted there. The verified `hx`/`hy` are ratios *within* one axis and
+  so are immune — which is exactly why nobody has been bitten by this yet.
+
+### What MediaPipe gives us that we currently throw away
+
+Candidates for a better vertical feature, most promising first. **No
+implementation, no decision** — feasibility notes only.
+
+| # | signal | feasibility |
+|---|---|---|
+| 1 | **Face blendshapes** (`output_face_blendshapes=True`, tasks): `eyeLookUpLeft/Right`, `eyeLookDownLeft/Right`, `eyeSquint*`, `eyeBlink*` | One options flag; a trained model's own vertical-gaze estimate, supervised on exactly this. Caveats: tasks-only (no legacy path), values are smoothed and can saturate at the extremes, and they are person-generic rather than calibrated. |
+| 2 | **Iris ring extent as the normaliser** — the 5 iris landmarks are averaged to a centre and their spread discarded; iris diameter is near-constant physically (~11.7 mm) | Already in the array, costs nothing, and buys distance invariance. Use the **horizontal** extent: the lids clip the iris top and bottom, so the vertical extent is the one measurement that is not trustworthy. |
+| 3 | **Facial transformation matrix** (`output_facial_transformation_matrixes=True`, tasks): 4×4 rigid head→camera | Better than the 6-point solvePnP, and would let landmarks be rotated into a head-fixed frame *before* any ratio is taken, removing pose contamination at source. Structural: changes what pose compensation means, so it reaches the verified core's inputs. |
+| 4 | **Full eyelid contours** (upper 246/161/160/159/158/157/173, lower 33/7/163/144/145/153/154/155, mirrored left) instead of the single 159/145 pair | Trivial; fitting a curve cuts per-point noise. But it improves *precision* of a compromised reference — it does not address the reference moving. |
+| 5 | **Orbital-rim landmarks** (brow 105/334, infraorbital ring) as a skull-fixed vertical scale | Easy to compute, but brow points move with expression, so "skull-fixed" is optimistic. Candidate **b**'s corner-to-corner line is the safer form of the same idea. |
+| 6 | **Iris ellipse eccentricity** — a rotating eye projects the circular iris to an ellipse whose minor axis shortens with gaze angle | Sound in principle, weak here: at 640×480 the iris is ~20 px across, so the change over ±15° is sub-pixel, and it needs the vertical extent the lids clip. |
+| 7 | **Landmark z-coordinates** (iris protrusion relative to the corners) | Low value: MediaPipe's z is weakly supervised and noisy at this scale. |
+| 8 | **Camera resolution** — not a MediaPipe feature, but the iris sub-model runs on a cropped eye ROI, so 1280×720 input gives it more pixels than 640×480 | Trivial to test, costs FPS. The cheapest experiment on this list. |
+
+**If a candidate wins clearly on real sittings**, `features-v2` is a **rule-9
+product decision** (it changes the verified core), and the migration plan is:
+proposal with the measured evidence → owner's approval → the whole calibration
+suite re-verified against the new feature, since every saved calibration and
+every pinned sign convention is expressed in the old one.
 
 ---
 
