@@ -1,0 +1,12 @@
+# GazeKey runtime dependencies (spec Section 1 — fixed stack)
+opencv-python>=4.8
+mediapipe>=0.10.9
+numpy>=1.24
+PyQt5>=5.15
+pynput>=1.7
+
+# Development / tests
+pytest>=7.4
+
+# No pyenchant (spec Section 1). Word prediction ships on a bundled offline
+# frequency list plus personal counts, with no extra dependency at all.

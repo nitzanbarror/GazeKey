@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# GazeKey never writes user data into the repo — config, calibration, the
+# personal word counts and the MediaPipe model bundle all live in ~/.gazekey/.
+# Listed here so a stray copy can never be committed by accident.
+.gazekey/
+calibration.json
+user_words.json
+*.task
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
