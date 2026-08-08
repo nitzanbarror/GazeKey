@@ -20,6 +20,9 @@ GazeKey: a desktop virtual keyboard controlled by eye gaze via a standard webcam
    - **The verified core** (spec Section 5.1: `gaze/features.py`, `gaze/calibration.py`, `gaze/smoothing.py`) — untouchable either way, as in rules 2 and 8.
 
    If you are unsure which bucket something falls in, treat it as a product decision and ask.
+10. **After every approved milestone or fix: commit AND push.** The remote is `origin` → https://github.com/nitzanbarror/GazeKey. A commit sitting only on this machine is not delivered — the work is not done until it is on the remote.
+    - **If the push fails, say so explicitly**, in the reply, naming the error (no remote, auth, rejected non-fast-forward, network). Never report "committed" and quietly leave it local, and never let a failed push pass without a sentence about it.
+    - "Approved" means I said so. Do not commit or push speculative or half-finished work to avoid this rule.
 
 ## Milestones (spec Section 11)
 - M1: Vision pipeline + live debug view — **done**
