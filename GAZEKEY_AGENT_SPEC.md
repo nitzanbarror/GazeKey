@@ -19,7 +19,7 @@ not simplify it.
 forward from M6, region-scoped calibration (Section 5.6), point-level
 calibration repair (Section 5.3), the typing-stability fixes of NFR-7 (sticky
 focus and a dwell that survives a steal) and the setup check of Section 5.1c.
-689 tests passing.**
+703 tests passing.**
 The NFR-7 fixes are implemented and tested but **not yet measured on hardware**
 — the after-measurement with `--debug-typing` is the next thing to do.
 Remaining scope: M6 (Hebrew + RTL only), then the two end-to-end scenarios in
@@ -1056,6 +1056,47 @@ reports almost nothing. The candidates are a 2×2 of that claim: **a** `hy`
 inter-corner distance (corner, corner), **c** lid aperture over eye width (the
 mechanism check), **d** upper-lid-to-iris over eye width (lid origin, fixed
 scale).
+
+**Every table self-labels who did the pointing, and the label can disqualify
+it.** A head that turns toward each dot leaves the eyeball barely rotating, so
+every candidate's span collapses and what the table then ranks is whatever
+responds to **head pitch** — not gaze. Two independent measurements say which
+happened, and neither assumes the other:
+
+- **eye rotation** from candidate b's span. b moves by `(R/W)·sin θ` where R is
+  the eyeball radius (~12 mm) and W the palpebral fissure width (~30 mm) —
+  a ratio of anthropometric constants, so **0.007 per degree** needs no camera
+  calibration and no distance estimate;
+- **head rotation** from the `solvePnP` pitch span, which is already on every
+  frame and costs nothing.
+
+`head_fraction = head / (eyes + head)` needs no geometry at all. The *expected*
+angle does — the dots subtend ~9.8° over the keyboard region at 600 mm on this
+panel — and it is printed with its assumptions so they can be argued with. The
+labels: **eyes-only** (< 25% head), **mixed**, **head-driven** (> 60% head),
+and **not-looking** when eyes plus head cover less than half the required
+angle. Only *eyes-only* is evidence about features; head-driven and
+not-looking override the reading rather than colouring it, and "unclear" — no
+pose data — overrides nothing, because an absent measurement is not evidence.
+
+> **The trap this exists to catch.** Candidate **c** scores well in a
+> head-driven sitting for a reason that has nothing to do with gaze: pitching
+> the head foreshortens the eye vertically, so the apparent fissure shrinks by
+> ~`cos(pitch)` while the eye width, being perpendicular to the pitch axis,
+> does not. c then measures head pose. **b and d foreshorten the same way**
+> (a vertical displacement over a horizontal length), so their advantage is
+> only bankable in a genuinely fixed-head sitting. **`hy` alone is immune** —
+> both its terms are vertical, so the compression cancels exactly. That
+> robustness is a real point in the baseline's favour and belongs in any
+> features-v2 argument.
+
+**The lab is not a gate and does not borrow the word.** It reuses the setup
+check's protocol, so it produces a `SetupCheckResult` — but with `gated=False`,
+which makes the console line read *"feature-lab baseline measured (diagnostic,
+no verdict)"* rather than PASS. It was reported printing `PASS` beside a span
+of 0.021 against a 0.035 threshold; the threshold was never applied, so the
+verdict, not the comparison, was the lie. The measured failure is left intact
+rather than cleared, so nothing is rewritten to make the wording true.
 
 Two things learned building it, both worth keeping:
 

@@ -249,6 +249,34 @@ nothing more than a smaller denominator. The table is a diagnosis, not a race:
 *b ≫ a* means the reference is the problem; *d ≈ a* means the numerator is;
 *c* moving at all is the mechanism (the lid really does track gaze).
 
+**Check the head-motion line first — it can disqualify the whole table:**
+
+```
+  head motion   : HEAD-DRIVEN - eyes 1.3 deg, head 8.0 deg (86% of the pointing done by the head)
+  expected      : the dots subtend 9.8 deg at 600 mm on a 174 mm panel; eyes+head covered 9.3 deg
+  WARNING       : the head did the pointing, so this table is not evidence about features...
+```
+
+If the head turns toward each dot the eyeball barely rotates, every span
+collapses, and the table ranks responses to head *pitch* instead of to gaze.
+Eye rotation is recovered from candidate b (it moves 0.007 per degree — a ratio
+of anthropometric constants, no calibration needed) and head rotation from the
+pose pitch that every frame already carries, so the two corroborate each other.
+Labels: **eyes-only** (< 25% head), **mixed**, **head-driven** (> 60%), and
+**not-looking** when neither covered the distance.
+
+The trap it exists to catch: **candidate c scores well in a head-driven sitting
+for a reason that is not gaze.** Pitching the head foreshortens the eye
+vertically, so the fissure shrinks by ~cos(pitch) while the eye width does not
+— c becomes a head-pose proxy. b and d foreshorten the same way, so their
+advantage only counts in a genuinely fixed-head sitting; **`hy` alone is
+immune**, both its terms being vertical, which is a real point in the
+baseline's favour.
+
+The lab **is not a gate**: its console line reads *"feature-lab baseline
+measured (diagnostic, no verdict)"*, never PASS or FAIL, because the threshold
+is a gate on calibrating and a diagnostic gates nothing.
+
 Spec Appendix B has the analysis, including what MediaPipe hands us that we
 currently discard — blendshapes (`eyeLookUp/Down`), the iris ring's extent as a
 distance-invariant normaliser, and the facial transformation matrix. Changing

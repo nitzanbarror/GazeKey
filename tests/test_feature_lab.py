@@ -54,7 +54,8 @@ def _set_iris(lm, idx, cx, cy, r=0.006):
     lm[idx[4], :2] = (cx, cy - r)
 
 
-def make_face(gaze_v=0.0, lid_follow=0.875, noise=0.0, rng=None, aperture=0.0):
+def make_face(gaze_v=0.0, lid_follow=0.875, noise=0.0, rng=None, aperture=0.0,
+              foreshorten=1.0):
     """A face looking ``gaze_v`` up/down whose lids chase the iris.
 
     Two separate real effects, because they break different halves of ``hy``:
@@ -69,6 +70,9 @@ def make_face(gaze_v=0.0, lid_follow=0.875, noise=0.0, rng=None, aperture=0.0):
             it moves ``hy``'s denominator without touching the upper-lid origin
             that ``hy`` and candidate d share — which is what makes d a clean
             separator rather than just another feature.
+        foreshorten: vertical compression about the eye line, ``cos(pitch)`` —
+            what a pitched head does to the *apparent* geometry without the
+            eyeball rotating at all.
         noise: per-landmark jitter, in normalised units.
     """
     lm = np.zeros((478, 3), dtype=np.float64)
@@ -91,6 +95,8 @@ def make_face(gaze_v=0.0, lid_follow=0.875, noise=0.0, rng=None, aperture=0.0):
     lm[152, :2] = (0.50, 0.80)
     lm[61, :2] = (0.43, 0.70)
     lm[291, :2] = (0.57, 0.70)
+    if foreshorten != 1.0:
+        lm[:, 1] = EYE_Y + (lm[:, 1] - EYE_Y) * foreshorten
     if noise and rng is not None:
         lm[:, :2] += rng.normal(0.0, noise, lm[:, :2].shape)
     return lm
@@ -366,23 +372,47 @@ class Sample:
         self.timestamp = features.timestamp
 
 
-def drive(session, seconds=60.0, lid_follow=0.875, noise=0.0, seed=0):
+def gaze_v_for(eye_deg):
+    """The ``gaze_v`` that makes candidate b span a given eye rotation.
+
+    b spans ``0.24 * gaze_v`` in this geometry and ``0.4 * sin(theta)`` in a
+    real eye, so the two can be tied together and the synthetic user given a
+    physically meaningful amount of eyeball rotation.
+    """
+    if eye_deg is None:
+        return 1.0
+    from gaze.feature_lab import EYE_GEOMETRY_RATIO
+
+    return EYE_GEOMETRY_RATIO * np.sin(np.radians(eye_deg)) / 0.24
+
+
+def drive(session, seconds=60.0, lid_follow=0.875, noise=0.0, seed=0,
+          aperture=0.0, eye_deg=None, head_pitch_deg=0.0):
     """Feed the session a user who looks at whichever dot is showing.
+
+    ``eye_deg`` is how far the eyeball actually rotates between the two dots
+    and ``head_pitch_deg`` how far the head does — the two knobs that decide
+    whether a sitting is eyes-only or head-driven. A pitched head also
+    foreshortens the eye vertically, which is modelled, because that is the
+    mechanism that makes candidate c a head-pose proxy.
 
     The clock starts at ``DT`` rather than 0: a ``FrameFeatures.timestamp`` of
     exactly 0.0 reads as "unset" and falls back to the wall clock.
     """
     rng = np.random.default_rng(seed)
+    amplitude = gaze_v_for(eye_deg)
     now = DT
     for _ in range(int(seconds / DT)):
         if session.is_finished:
             break
         target = session.current_target()
         # target 1 is the top dot (look up, gaze_v -1), target 2 the bottom
-        gaze_v = 0.0 if target is None else (-1.0 if target.index % 2 else +1.0)
-        face = make_face(gaze_v=gaze_v, lid_follow=lid_follow,
-                         noise=noise, rng=rng)
-        features = extract_features(face, 0.0, 0.0, 0.0, now)
+        direction = 0.0 if target is None else (-1.0 if target.index % 2 else +1.0)
+        pitch = -direction * head_pitch_deg / 2.0        # nods down for the low dot
+        face = make_face(gaze_v=direction * amplitude, lid_follow=lid_follow,
+                         aperture=aperture, noise=noise, rng=rng,
+                         foreshorten=float(np.cos(np.radians(pitch))))
+        features = extract_features(face, 0.0, pitch, 0.0, now)
         sample = Sample(features, to_px(face))
         session.observe(sample)
         session.update(features)
@@ -481,6 +511,164 @@ def test_a_frame_without_landmarks_is_skipped_not_guessed():
         session.update(features)
         now += DT
     assert session.visits == [], "no landmarks means no candidates, not zeros"
+
+
+# ------------------------------------------- a diagnostic claims no verdict
+def test_the_lab_does_not_print_a_verdict_it_never_applied():
+    """Reported from a real sitting: the lab logged PASS on a 0.021 span.
+
+    The gate's threshold is 0.035, so PASS was simply false. The lab does not
+    gate — that is right — but it must then say so rather than borrow the
+    word.
+    """
+    session = FeatureLabSession(SCREEN, seconds=6.0)
+    drive(session, lid_follow=0.875)
+    line = session.result.console_line()
+
+    assert "PASS" not in line and "FAIL" not in line
+    assert "no verdict" in line and "diagnostic" in line
+    assert "feature-lab" in line, "and not call itself the setup check"
+    assert f"{session.result.hy_span:.3f}" in line, "the number is still there"
+
+
+def test_an_ungated_result_never_blocks():
+    session = FeatureLabSession(SCREEN, seconds=6.0)
+    drive(session, lid_follow=1.0)              # hy span ~0, well under the gate
+    assert not session.result.gated
+    assert session.result.passed, "a diagnostic must not stop the app"
+    assert session.phase is SetupPhase.PASSED
+
+
+def test_the_ungated_result_keeps_what_was_measured():
+    """The failure is left intact rather than rewritten to make PASS true."""
+    session = FeatureLabSession(SCREEN, seconds=6.0)
+    drive(session, lid_follow=1.0)
+    assert session.result.hy_span < session.result.min_hy_span
+    assert session.result.failure is not None, \
+        "clearing it would hide the measurement behind the wording fix"
+
+
+def test_the_real_gate_still_says_pass_and_fail():
+    """The wording fix must not reach the check that does gate."""
+    from gaze.setup_check import SetupCheckResult
+
+    good = SetupCheckResult(hy_span=0.051, min_hy_span=0.035)
+    assert "PASS" in good.console_line() and good.passed
+    assert "setup check" in good.console_line()
+
+    from gaze.setup_check import SetupFailure
+
+    bad = SetupCheckResult(hy_span=0.021, min_hy_span=0.035,
+                           failure=SetupFailure.LOW_SPAN)
+    assert "FAIL" in bad.console_line() and not bad.passed
+
+
+# --------------------------------------------------- who pointed at the dots
+def test_eye_rotation_is_recovered_from_candidate_b():
+    """b moves ~0.007 per degree: R/W is 12/30 and needs no calibration."""
+    from gaze.feature_lab import eye_rotation_deg
+
+    assert eye_rotation_deg(0.0096) == pytest.approx(1.38, abs=0.05)
+    assert eye_rotation_deg(0.0687) == pytest.approx(10.0, abs=0.3)
+    assert np.isnan(eye_rotation_deg(float("nan")))
+
+
+def test_the_dots_subtended_angle_matches_the_geometry():
+    from gaze.feature_lab import subtended_deg
+
+    # 456 px of 768 on a 174 mm panel at 600 mm - the development machine
+    assert subtended_deg(456, 768) == pytest.approx(9.8, abs=0.2)
+    assert subtended_deg(456, 768, viewing_mm=300) > subtended_deg(456, 768)
+    assert np.isnan(subtended_deg(456, 0))
+
+
+def _motion(eye_deg, head_deg, required_deg=9.8):
+    from gaze.feature_lab import HeadMotion
+
+    return HeadMotion(eye_deg=eye_deg, head_deg=head_deg,
+                      required_deg=required_deg)
+
+
+def test_a_sitting_labels_itself_eyes_only_or_head_driven():
+    assert _motion(9.5, 0.4).label == "eyes-only"
+    assert _motion(1.4, 8.4).label == "head-driven"
+    assert _motion(5.0, 4.8).label == "mixed"
+
+
+def test_the_reported_sitting_is_named_head_driven():
+    """The first real table: b span 0.0096 against ~9.8 deg of dot separation."""
+    from gaze.feature_lab import eye_rotation_deg
+
+    motion = _motion(eye_rotation_deg(0.0096), 8.4)
+    assert motion.label == "head-driven"
+    assert motion.head_fraction > 0.85
+    assert not motion.trustworthy
+
+
+def test_neither_eyes_nor_head_moving_is_called_out_separately():
+    """A different failure from head-driven: the dots were not looked at."""
+    motion = _motion(0.3, 0.2)
+    assert motion.label == "not-looking"
+    assert "probably not" in " ".join(motion.lines())
+
+
+def test_a_head_driven_table_says_it_is_not_evidence_about_features():
+    motion = _motion(1.4, 8.4)
+    text = " ".join(motion.lines())
+    assert "not evidence about features" in text
+    assert "foreshortens" in text, "the c confound has to be named"
+    assert "hy alone is immune" in text
+
+
+def test_the_head_indicator_reaches_the_table_and_the_reading():
+    session = FeatureLabSession(SCREEN, seconds=12.0)
+    report = drive(session, lid_follow=0.875, eye_deg=1.4, head_pitch_deg=8.0,
+                   noise=0.0004)
+
+    assert report.head_motion().label == "head-driven"
+    text = "\n".join(report.lines())
+    assert "head motion   : HEAD-DRIVEN" in text
+    assert "expected      :" in text
+    assert "head did" in report.reading()
+
+
+def test_an_eyes_only_sitting_is_not_warned_about():
+    session = FeatureLabSession(SCREEN, seconds=12.0)
+    report = drive(session, lid_follow=0.875, head_pitch_deg=0.0,
+                   eye_deg=10.0, noise=0.0004)
+
+    motion = report.head_motion()
+    assert motion.label == "eyes-only" and motion.trustworthy
+    assert "not evidence" not in "\n".join(report.lines())
+    assert "carries" in report.reading(), "and the comparison stands"
+
+
+# ---------------------------------------------- the confound, demonstrated
+def test_head_pitch_alone_moves_the_aperture_candidate():
+    """Why c cannot be trusted in a head-driven sitting.
+
+    Pitching the head foreshortens the eye vertically. The fissure shrinks by
+    cos(pitch); the eye width, perpendicular to the pitch axis, does not.
+    """
+    upright = to_px(make_face(gaze_v=0.0))
+    pitched = to_px(make_face(gaze_v=0.0, foreshorten=0.85))
+
+    assert lid_aperture(pitched) < 0.9 * lid_aperture(upright), \
+        "c moves with head pitch even though the eye did not rotate"
+
+
+def test_hy_is_the_one_candidate_immune_to_foreshortening():
+    """Both of hy's terms are vertical, so the compression cancels."""
+    for gaze_v in (-1.0, 0.0, +1.0):
+        upright = make_face(gaze_v=gaze_v)
+        pitched = make_face(gaze_v=gaze_v, foreshorten=0.85)
+        assert hy_of(pitched) == pytest.approx(hy_of(upright), abs=1e-9)
+
+    # ...while b and d are a vertical displacement over a horizontal length
+    b_upright = iris_vs_corner_line(to_px(make_face(gaze_v=+1.0)))
+    b_pitched = iris_vs_corner_line(to_px(make_face(gaze_v=+1.0,
+                                                    foreshorten=0.85)))
+    assert b_pitched == pytest.approx(0.85 * b_upright, rel=1e-6)
 
 
 # ------------------------------------------------------------- the core is safe

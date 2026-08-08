@@ -127,10 +127,17 @@ class SetupCheckResult:
     failure: Optional[SetupFailure] = None
     #: the user chose to calibrate anyway after a failed check
     overridden: bool = False
+    #: Is this run a **gate**? ``--feature-lab`` reuses this protocol to
+    #: measure, not to judge, and a diagnostic that prints "PASS" next to a
+    #: span below the threshold is worse than one that prints nothing.
+    gated: bool = True
+    #: what to call this run in the console
+    label: str = "setup check"
 
     @property
     def passed(self) -> bool:
-        return self.failure is None
+        """Whether calibration may proceed. An ungated run never blocks."""
+        return not self.gated or self.failure is None
 
     @property
     def text(self) -> Tuple[str, str]:
@@ -148,10 +155,15 @@ class SetupCheckResult:
                 f"(needs {self.min_hy_span:.3f})")
 
     def console_line(self) -> str:
-        verdict = "PASS" if self.passed else "FAIL"
-        if self.overridden:
-            verdict += " (continuing anyway)"
-        return (f"setup check {verdict}: hy span {self.hy_span:.3f} "
+        if not self.gated:
+            # No verdict, because none was applied: the threshold is a gate on
+            # calibrating, and this run is not gating anything.
+            verdict = "measured (diagnostic, no verdict)"
+        else:
+            verdict = "PASS" if self.passed else "FAIL"
+            if self.overridden:
+                verdict += " (continuing anyway)"
+        return (f"{self.label} {verdict}: hy span {self.hy_span:.3f} "
                 f"(top {self.hy_top:.3f}, bottom {self.hy_bottom:.3f}, "
                 f"kept {self.samples[0]}/{self.collected[0]}"
                 f"+{self.samples[1]}/{self.collected[1]}, "

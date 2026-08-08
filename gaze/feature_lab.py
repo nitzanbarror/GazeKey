@@ -81,6 +81,159 @@ from gaze.features import (
 from gaze.region import Region
 from gaze.setup_check import SetupCheckResult, SetupCheckSession, SetupPhase
 
+# --------------------------------------------------- did the eyes do the work?
+#: Anthropometric constants, both stable across adults to a few percent: the
+#: eyeball's radius and the palpebral fissure's width (corner to corner). Their
+#: **ratio** is what candidate b is measured in, so it needs no camera
+#: calibration and no distance estimate — b moves by
+#: ``(R/W) * sin(theta)``, i.e. about 0.007 per degree of eye rotation.
+EYEBALL_RADIUS_MM = 12.0
+FISSURE_WIDTH_MM = 30.0
+EYE_GEOMETRY_RATIO = EYEBALL_RADIUS_MM / FISSURE_WIDTH_MM
+
+#: Assumptions behind the *expected* angle only, and printed with the result so
+#: they can be argued with: the distance the app tells the user to sit at, and
+#: the development machine's panel (14" 16:9).
+VIEWING_DISTANCE_MM = 600.0
+SCREEN_HEIGHT_MM = 174.0
+
+#: head pitch travels alongside the candidates, as context rather than as a
+#: candidate — it never appears in the comparison table
+PITCH_KEY = "_pitch"
+
+#: head share below this is an eyes-only sitting, above the second is
+#: head-driven; between them the evidence is mixed
+EYES_ONLY_BELOW = 0.25
+HEAD_DRIVEN_ABOVE = 0.60
+
+#: less than this fraction of the required angle accounted for by eyes plus
+#: head means the dots were probably not looked at at all
+ACCOUNTED_MIN = 0.5
+
+
+def eye_rotation_deg(b_span: float) -> float:
+    """Degrees of eyeball rotation behind a given span of candidate b."""
+    if not np.isfinite(b_span):
+        return float("nan")
+    return float(np.degrees(np.arcsin(
+        np.clip(abs(b_span) / EYE_GEOMETRY_RATIO, -1.0, 1.0))))
+
+
+def subtended_deg(separation_px: float, screen_px: float,
+                  screen_mm: float = SCREEN_HEIGHT_MM,
+                  viewing_mm: float = VIEWING_DISTANCE_MM) -> float:
+    """How far apart the two dots are, in degrees of gaze at the eye."""
+    if screen_px <= 0 or viewing_mm <= 0:
+        return float("nan")
+    millimetres = separation_px / screen_px * screen_mm
+    return float(2.0 * np.degrees(np.arctan(millimetres / 2.0 / viewing_mm)))
+
+
+@dataclass
+class HeadMotion:
+    """Who actually pointed at the dots — the eyes, or the head?
+
+    Without this a table is uninterpretable, and worse, quietly misleading. If
+    the head does the pointing then the eyeball barely rotates, every
+    candidate's span collapses toward zero, and what survives is whatever
+    responds to **head pitch** rather than to gaze. Candidate c is the trap:
+    pitching the head foreshortens the eye vertically, so the apparent lid
+    aperture shrinks by roughly ``cos(pitch)`` while the eye width, being
+    perpendicular to the pitch axis, does not — c then scores well as a pure
+    head-pose proxy that would be worthless in a fixed-head session.
+
+    Candidates b and d are foreshortened the same way (a vertical displacement
+    over a horizontal length). The baseline ``hy`` is the one that is *not*:
+    numerator and denominator are both vertical, so the compression cancels.
+    """
+
+    eye_deg: float
+    head_deg: float
+    required_deg: float
+    viewing_mm: float = VIEWING_DISTANCE_MM
+    screen_mm: float = SCREEN_HEIGHT_MM
+
+    @property
+    def total_deg(self) -> float:
+        return self.eye_deg + self.head_deg
+
+    @property
+    def head_fraction(self) -> float:
+        """Share of the measured pointing done by the head. No geometry needed
+        for this one: both angles are measured, not assumed."""
+        total = self.total_deg
+        if not np.isfinite(total) or total <= 1e-6:
+            return float("nan")
+        return self.head_deg / total
+
+    @property
+    def accounted(self) -> float:
+        """Measured travel over the travel the dots demanded."""
+        if not np.isfinite(self.required_deg) or self.required_deg <= 1e-6:
+            return float("nan")
+        return self.total_deg / self.required_deg
+
+    @property
+    def label(self) -> str:
+        share = self.head_fraction
+        if not np.isfinite(share):
+            return "unclear"
+        if np.isfinite(self.accounted) and self.accounted < ACCOUNTED_MIN:
+            return "not-looking"
+        if share < EYES_ONLY_BELOW:
+            return "eyes-only"
+        if share > HEAD_DRIVEN_ABOVE:
+            return "head-driven"
+        return "mixed"
+
+    @property
+    def trustworthy(self) -> bool:
+        """Is this sitting evidence about *features* at all?"""
+        return self.label == "eyes-only"
+
+    @property
+    def discredits_the_table(self) -> bool:
+        """Is there positive evidence that the rows are not about gaze?
+
+        Deliberately not the negation of :attr:`trustworthy`: "unclear" means
+        the head motion could not be measured, and an absent measurement is
+        not grounds for overruling the table.
+        """
+        return self.label in ("head-driven", "not-looking")
+
+    def lines(self) -> List[str]:
+        share = self.head_fraction
+        if not np.isfinite(share):
+            return ["  head motion   : not measured - no head pose in these "
+                    "frames, so who did the pointing is unknown"]
+        out = [
+            f"  head motion   : {self.label.upper()} - eyes "
+            f"{self.eye_deg:.1f} deg, head {self.head_deg:.1f} deg "
+            f"({share * 100:.0f}% of the pointing done by the head)",
+            f"  expected      : the dots subtend {self.required_deg:.1f} deg "
+            f"at {self.viewing_mm:.0f} mm on a {self.screen_mm:.0f} mm panel; "
+            f"eyes+head covered {self.total_deg:.1f} deg",
+        ]
+        if self.label == "not-looking":
+            out.append("  WARNING       : neither the eyes nor the head covered "
+                       "the distance between the dots - they were probably not "
+                       "looked at, and no row above means anything.")
+        elif self.label == "head-driven":
+            out.append("  WARNING       : the head did the pointing, so this "
+                       "table is not evidence about features. Every span is "
+                       "compressed by the eyeball barely rotating, and c is "
+                       "actively misleading - pitching the head foreshortens "
+                       "the eye vertically, so lid aperture tracks head pose "
+                       "rather than gaze. b and d foreshorten the same way; "
+                       "hy alone is immune (both its terms are vertical). "
+                       "Rest the head properly and re-run.")
+        elif self.label == "mixed":
+            out.append("  CAUTION       : the head did a substantial share, so "
+                       "the spans are part gaze and part head pose - treat the "
+                       "ranking as provisional and re-run with the head rested.")
+        return out
+
+
 #: one eye's landmark indices: (iris, corner, corner, upper lid, lower lid).
 #: The two corners are handed over unordered on purpose — every candidate here
 #: sorts them along the image x-axis, so neither the "inner"/"outer" labelling
@@ -259,10 +412,37 @@ class CandidateReport:
 class FeatureLabReport:
     """The comparison table, and the one-line reading of it."""
 
-    def __init__(self, visits: List[Visit], baseline_key: str = "a_hy") -> None:
+    def __init__(self, visits: List[Visit], baseline_key: str = "a_hy",
+                 separation_px: float = 0.0, screen_px: float = 0.0,
+                 screen_mm: float = SCREEN_HEIGHT_MM,
+                 viewing_mm: float = VIEWING_DISTANCE_MM) -> None:
         self.visits = visits
         self.baseline_key = baseline_key
+        self.separation_px = separation_px
+        self.screen_px = screen_px
+        self.screen_mm = screen_mm
+        self.viewing_mm = viewing_mm
         self.candidates = [self._report(c) for c in CANDIDATES]
+
+    # ------------------------------------------------------------ head motion
+    def head_motion(self) -> HeadMotion:
+        """Eye rotation from candidate b, head rotation from the pose pitch.
+
+        Two independent measurements — one from the iris against the eye
+        corners, one from ``solvePnP`` — so they corroborate rather than
+        assume each other. Only the *expected* angle needs geometry.
+        """
+        corner = self.find("b_corner")
+        pitch_top = _median(self._pooled(PITCH_KEY, 0))
+        pitch_bottom = _median(self._pooled(PITCH_KEY, 1))
+        return HeadMotion(
+            eye_deg=eye_rotation_deg(corner.span if corner else float("nan")),
+            head_deg=abs(pitch_bottom - pitch_top),
+            required_deg=subtended_deg(self.separation_px, self.screen_px,
+                                       self.screen_mm, self.viewing_mm),
+            viewing_mm=self.viewing_mm,
+            screen_mm=self.screen_mm,
+        )
 
     # ------------------------------------------------------------- statistics
     def _pooled(self, key: str, target_index: int) -> List[float]:
@@ -355,6 +535,7 @@ class FeatureLabReport:
             spans = "  ".join(f"{s:.4f}" for s in report.per_cycle_spans)
             if spans:
                 out.append(f"  per-cycle span  {report.key:<12} {spans}")
+        out.extend(self.head_motion().lines())
         out.append(f"  reading       : {self.reading()}")
         out.append("  note          : only the vertical axis is exercised here; "
                    "hx is not measured by this protocol.")
@@ -365,6 +546,13 @@ class FeatureLabReport:
         baseline, winner = self.baseline, self.winner()
         if baseline is None or winner is None or not np.isfinite(winner.snr):
             return "not enough data to compare."
+
+        motion = self.head_motion()
+        if motion.discredits_the_table:
+            return (f"{motion.label} sitting - the head did "
+                    f"{motion.head_fraction * 100:.0f}% of the pointing, so "
+                    f"these rows rank responses to head pose, not to gaze. "
+                    f"Not evidence about features either way.")
         aperture = self.find("c_aperture")
         lid_iris = self.find("d_lid_iris")
         factor = self.improvement()
@@ -403,8 +591,14 @@ class FeatureLabSession(SetupCheckSession):
     """
 
     def __init__(self, screen_size, region: Optional[Region] = None,
-                 seconds: float = 12.0, **kwargs) -> None:
+                 seconds: float = 12.0,
+                 screen_mm: float = SCREEN_HEIGHT_MM,
+                 viewing_mm: float = VIEWING_DISTANCE_MM, **kwargs) -> None:
         super().__init__(screen_size, region=region, **kwargs)
+        #: only the *expected* angle depends on these, and the report prints
+        #: them so the assumption can be argued with
+        self.screen_mm = float(screen_mm)
+        self.viewing_mm = float(viewing_mm)
         base = list(self.targets)
         self.cycles = max(1, int(round(
             seconds / max(2.0 * (self.settle_s + self.collect_samples / 30.0),
@@ -438,6 +632,8 @@ class FeatureLabSession(SetupCheckSession):
         visit = self._visit(index)
         for candidate in CANDIDATES:
             visit.record(candidate.key, candidate.value(features, px))
+        # context, not a candidate: how much the *head* moved between the dots
+        visit.record(PITCH_KEY, float(features.pitch))
 
     def _visit(self, index: int) -> Visit:
         if not self.visits or self.visits[-1].target_index != index % 2 \
@@ -453,10 +649,19 @@ class FeatureLabSession(SetupCheckSession):
         can treat this exactly like a finished check and get out of the way.
         """
         result = super()._evaluate()
-        self.report = FeatureLabReport(self.visits)
-        # A lab run is never a gate: it always "passes" so nothing blocks on a
-        # diagnostic, and the table is the output.
-        result.failure = None
+        rows = sorted({y for _, y in self.targets})
+        self.report = FeatureLabReport(
+            self.visits,
+            separation_px=abs(rows[-1] - rows[0]),
+            screen_px=float(self.screen_size[1]),
+            screen_mm=self.screen_mm, viewing_mm=self.viewing_mm)
+        # A lab run is not a gate. It must not block, and — the point of
+        # ``gated`` — it must not claim a verdict it never applied: printing
+        # "PASS" beside a span under the threshold is worse than printing no
+        # verdict at all. The failure is left intact rather than cleared, so
+        # nothing here quietly rewrites what was measured.
+        result.gated = False
+        result.label = "feature-lab baseline"
         self.phase = SetupPhase.PASSED
         return result
 
