@@ -25,7 +25,7 @@ app knows not to inject it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -75,6 +75,45 @@ class Activation:
     suppressed: bool = False     # paused: feedback happened, injection must not
 
 
+@dataclass
+class DwellStats:
+    """Why dwells complete or don't — the raw counts behind ``--debug-typing``.
+
+    Purely observational: nothing here changes what the machine does. The three
+    loss causes are mutually exclusive per event, so they add up to "times the
+    user was trying to select something and did not".
+    """
+
+    frames: int = 0
+    stream_lost: int = 0
+    #: the focused key changed (including the first landing on a key)
+    focus_changes: int = 0
+    #: ...and it changed while a dwell was part-way through, discarding it
+    focus_stolen: int = 0
+    #: the fixation detector let go mid-dwell, so progress stalled
+    fixation_dropped: int = 0
+    #: the gaze left every key and the accumulated dwell decayed to nothing
+    grace_expired: int = 0
+    activations: int = 0
+
+    @property
+    def dwell_losses(self) -> int:
+        return self.focus_stolen + self.fixation_dropped + self.grace_expired
+
+    def snapshot(self) -> "DwellStats":
+        return replace(self)
+
+    def since(self, earlier: "DwellStats") -> "DwellStats":
+        """This minus an earlier snapshot, for per-window reporting."""
+        return DwellStats(**{
+            name: getattr(self, name) - getattr(earlier, name)
+            for name in (
+                "frames", "stream_lost", "focus_changes", "focus_stolen",
+                "fixation_dropped", "grace_expired", "activations",
+            )
+        })
+
+
 class DwellController:
     """Drives key focus and dwell from a stream of gaze samples."""
 
@@ -95,6 +134,9 @@ class DwellController:
         self._leave_accumulated = 0.0
         self._last_t: Optional[float] = None
         self._refractory_until: Dict[str, float] = {}
+        self._was_fixating = False
+        #: observational only — see :class:`DwellStats`
+        self.stats = DwellStats()
 
     # ------------------------------------------------------------------ state
     @property
@@ -156,13 +198,31 @@ class DwellController:
         stream_valid: bool,
         now: float,
     ) -> Optional[Activation]:
-        """Advance the machine by one sample; returns a key if one fired."""
+        """Advance the machine by one sample; returns a key if one fired.
+
+        A thin wrapper around :meth:`_advance` so the fixation edge can be
+        tracked in one place instead of at every return.
+        """
+        self.stats.frames += 1
+        activation = self._advance(x, y, is_fixating, stream_valid, now)
+        self._was_fixating = bool(is_fixating and stream_valid)
+        return activation
+
+    def _advance(
+        self,
+        x: float,
+        y: float,
+        is_fixating: bool,
+        stream_valid: bool,
+        now: float,
+    ) -> Optional[Activation]:
         dt = 0.0 if self._last_t is None else max(0.0, now - self._last_t)
         self._last_t = now
 
         if not stream_valid:
             # Tracking lost: freeze rather than reset, so a blink mid-dwell
             # costs time but not progress (spec Section 6).
+            self.stats.stream_lost += 1
             return None
 
         key = self._hit_test(x, y)
@@ -171,6 +231,9 @@ class DwellController:
             return None
 
         if self._focused is None or key.id != self._focused.id:
+            self.stats.focus_changes += 1
+            if self._accumulated > 0.0:
+                self.stats.focus_stolen += 1
             self._focused = key
             self._accumulated = 0.0
             self._leaving = False
@@ -182,12 +245,16 @@ class DwellController:
             return None
 
         if not is_fixating:
+            # Count the edge, not every frame: one wobble is one lost dwell.
+            if self._accumulated > 0.0 and self._was_fixating:
+                self.stats.fixation_dropped += 1
             return None                     # inside the key but the eye is moving
 
         self._accumulated += dt
         if self._accumulated >= self.required_s(key):
             self._accumulated = 0.0
             self._refractory_until[key.id] = now + self.settings.refractory_ms / 1000.0
+            self.stats.activations += 1
             return Activation(key, now, suppressed=not self.is_live(key))
         return None
 
@@ -213,4 +280,6 @@ class DwellController:
         grace_s = max(self.settings.grace_ms / 1000.0, 1e-6)
         self._accumulated -= self._leave_accumulated * dt / grace_s
         if self._accumulated <= 0.0:
+            if self._leave_accumulated > 1e-6:      # there was real progress
+                self.stats.grace_expired += 1
             self._clear_focus()

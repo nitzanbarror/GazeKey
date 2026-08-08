@@ -129,6 +129,44 @@ columns; its drift note points at Recalibrate instead.)
 Options: `--layout qwerty-tall|paged|auto`, `--height-ratio`, `--dwell`,
 `--no-cursor`, `--no-webcam`, `--camera N`.
 
+## When typing will not select — `--debug-typing`
+
+```bash
+python main.py --debug-typing
+```
+
+Every 5 s (`--debug-interval`) it prints one line, and a summary on quit:
+
+```
+[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0
+                jitter x   6 y  45 px  spread x 201 y  69  fixating 100%  keys 0
+```
+
+| | |
+|---|---|
+| `focus /s` | how often the focused key changes. Healthy is under ~1/s; 10/s is flapping |
+| `steal` | dwells discarded because a neighbour took focus mid-hold |
+| `fixdrop` | dwells stalled because the fixation detector let go |
+| `grace` | dwells that decayed away after the gaze left every key |
+| `jitter x/y` | median wobble inside ~1/3 s buckets — the number that predicts steals. Compare against the key size |
+| `spread x/y` | deviation across the whole window, **including moving between keys**. Large by design; not a fault |
+| `fixating` | duty cycle of the I-DT detector |
+
+Read `jitter` against the key size, not `spread`: a session moving across the
+board reads ~350 px of spread on x while the actual wobble is 6 px, so the
+window-wide figure names the wrong axis.
+
+Three knobs, each falling back to config and then to the default, so an absent
+flag changes nothing: `--hysteresis` (0.25), `--min-cutoff` (One-Euro, 1.0 —
+lower is smoother and laggier), `--grace-ms` (200).
+
+> **Two of those three are currently inert for typing between keys**, and the
+> app says so in `--help`. Hit regions are gapless, so a neighbour always wins
+> focus outright and the hysteresis margin is only consulted off the board;
+> and a focus steal discards the dwell instantly without ever reaching the
+> grace decay. Only `--min-cutoff` reduces the jitter that causes the steals.
+> Spec NFR-7 has the measurements and the candidate fixes.
+
 ## Word prediction
 
 Local, instant and offline (spec NFR-5) — nothing about what is typed leaves the

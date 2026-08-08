@@ -70,6 +70,7 @@ class KeyboardOverlay(QWidget):
         predictor: Optional[WordPredictor] = None,
         show_webcam: bool = True,
         drift: Optional[DriftMonitor] = None,
+        diagnostics=None,
         tick_ms: int = 16,
         parent: Optional[QWidget] = None,
     ) -> None:
@@ -92,6 +93,8 @@ class KeyboardOverlay(QWidget):
         self.word = WordBuffer()
         self.suggestions: List[str] = []
         self.drift = drift if drift is not None else DriftMonitor()
+        #: optional TypingDiagnostics (--debug-typing); observational only
+        self.diagnostics = diagnostics
 
         self._notice = ""
         self._notice_until = 0.0
@@ -149,9 +152,13 @@ class KeyboardOverlay(QWidget):
     # ------------------------------------------------------------------- loop
     def tick(self) -> None:
         """Drain the pipeline, advance the dwell, inject what fired."""
+        last_timestamp = None
         if self.pipeline is not None:
             for sample in self.pipeline.drain():
                 self._saw_frame = True
+                last_timestamp = sample.timestamp
+                if self.diagnostics is not None:
+                    self.diagnostics.record(sample)
                 self._is_fixating = sample.is_fixating
                 self._stream_valid = sample.stream_valid
                 self._held = sample.held
@@ -168,6 +175,8 @@ class KeyboardOverlay(QWidget):
                 )
                 if activation is not None:
                     self.dispatch(activation)
+        if self.diagnostics is not None and last_timestamp is not None:
+            self.diagnostics.tick(last_timestamp)
         self.update()
 
     def dispatch(self, activation: Activation) -> None:

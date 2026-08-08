@@ -36,6 +36,9 @@ DEFAULTS: Dict[str, Any] = {
     # fixation detection (spec Section 6) — see DISPERSION_RATIO below
     "fixation_window_ms": 150,
     "fixation_dispersion_px": 110,
+    # One-Euro smoothing: lower min_cutoff = smoother but laggier. The knob for
+    # gaze jitter that keeps crossing key boundaries mid-dwell.
+    "one_euro_min_cutoff": 1.0,
     # how long a blink or a lost face keeps the last gaze position alive
     "tracking_hold_ms": 300,
     # drift monitor (spec 5.5): how large an offset between a key's centre and
@@ -78,6 +81,29 @@ def suggested_fixation_dispersion_px(validation_error_px: float) -> float:
         return float(DEFAULTS["fixation_dispersion_px"])
     scaled = DISPERSION_RATIO * float(validation_error_px)
     return float(min(DISPERSION_MAX_PX, max(DISPERSION_MIN_PX, round(scaled))))
+
+#: The knobs that govern typing stability, and where each is read from.
+#: ``(config key, argparse attribute)`` — see :func:`resolve_tuning`.
+TUNING_KNOBS = {
+    "hysteresis_margin": ("hysteresis_margin", "hysteresis"),
+    "grace_ms": ("grace_period_ms", "grace_ms"),
+    "min_cutoff": ("one_euro_min_cutoff", "min_cutoff"),
+}
+
+
+def resolve_tuning(config: Dict[str, Any], args: Any = None) -> Dict[str, float]:
+    """Merge the stability knobs: an explicit flag beats config beats default.
+
+    A flag is "absent" when it is ``None``, so ``--hysteresis 0`` is a real
+    request for zero rather than a fallback to config.
+    """
+    resolved: Dict[str, float] = {}
+    for name, (config_key, flag) in TUNING_KNOBS.items():
+        value = config.get(config_key, DEFAULTS[config_key])
+        override = getattr(args, flag, None) if args is not None else None
+        resolved[name] = float(override if override is not None else value)
+    return resolved
+
 
 #: gentler pacing for first-time users (``calibrate.py --slow``)
 SLOW_PRESET = {

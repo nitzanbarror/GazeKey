@@ -83,6 +83,8 @@ class GazePipeline:
         fixation_window_ms: float = 150.0,
         fixation_dispersion_px: float = 110.0,
         tracking_hold_ms: float = 300.0,
+        min_cutoff: float = 1.0,
+        beta: float = 0.007,
         camera_factory: Optional[Callable[[], CameraSource]] = None,
         tracker_factory: Optional[Callable[[], FaceTracker]] = None,
         log: Callable[[str], None] = print,
@@ -100,11 +102,16 @@ class GazePipeline:
         self.fixation_window_ms = fixation_window_ms
         self.fixation_dispersion_px = fixation_dispersion_px
         self.tracking_hold_s = tracking_hold_ms / 1000.0
+        #: One-Euro tuning (spec Section 6). Lowering ``min_cutoff`` smooths
+        #: harder at the cost of lag — the knob for gaze jitter that keeps
+        #: crossing key boundaries and stealing focus mid-dwell.
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
 
         self._queue: "queue.Queue[GazeSample]" = queue.Queue()
         self._model_lock = threading.Lock()
         self._model = model
-        self._filters = (OneEuroFilter(), OneEuroFilter())
+        self._filters = self._new_filters()
         self._fixation = FixationDetector(fixation_window_ms, fixation_dispersion_px)
         self._last_gaze: Optional[tuple[float, float, float]] = None
         self._last_fixating = False
@@ -195,11 +202,16 @@ class GazePipeline:
         with self._preview_lock:
             return None if self._preview is None else self._preview.copy()
 
+    def _new_filters(self) -> tuple:
+        """A fresh One-Euro pair at the configured tuning, one per axis."""
+        return (OneEuroFilter(min_cutoff=self.min_cutoff, beta=self.beta),
+                OneEuroFilter(min_cutoff=self.min_cutoff, beta=self.beta))
+
     def set_model(self, model: Optional[CalibrationModel]) -> None:
         """Install (or clear) the model and reset smoothing, fixation and hold."""
         with self._model_lock:
             self._model = model
-            self._filters = (OneEuroFilter(), OneEuroFilter())
+            self._filters = self._new_filters()
             self._fixation = FixationDetector(
                 self.fixation_window_ms, self.fixation_dispersion_px
             )

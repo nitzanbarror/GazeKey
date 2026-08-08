@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from typing import Optional
 
 from PyQt5.QtCore import Qt
@@ -33,6 +34,7 @@ from calibrate import report_camera_failure, resolve_pacing, wait_for_camera
 from config import (
     calibration_path,
     load_config,
+    resolve_tuning,
     suggested_fixation_dispersion_px,
 )
 from gaze.calibration import CalibrationModel
@@ -40,6 +42,7 @@ from gaze.calibration_session import CalibrationSession
 from gaze.drift import DriftMonitor, TouchUpSession
 from gaze.region import attach_region, full_screen_region, read_region
 from interaction.controller import DwellController, DwellSettings
+from interaction.diagnostics import TypingDiagnostics
 from interaction.hotkey import HOTKEY_LABEL, GlobalQuitHotkey
 from interaction.injector import make_injector
 from interaction.layouts import MAX_HEIGHT_RATIO, build_keyboard, keyboard_region
@@ -96,7 +99,9 @@ class GazeKeyApp:
         self.geometry = geometry
         self.region = self.calibration_region()
 
+        self.tuning = resolve_tuning(self.config, args)
         self.pipeline: Optional[GazePipeline] = None
+        self.typing: Optional[TypingDiagnostics] = None
         self.injector = None
         self.predictor: Optional[WordPredictor] = None
         self.hotkey: Optional[GlobalQuitHotkey] = None
@@ -139,6 +144,7 @@ class GazeKeyApp:
             fixation_window_ms=float(self.config["fixation_window_ms"]),
             fixation_dispersion_px=float(self.config["fixation_dispersion_px"]),
             tracking_hold_ms=float(self.config["tracking_hold_ms"]),
+            min_cutoff=self.tuning["min_cutoff"],
         )
         self.pipeline.start()
         if self.pipeline.last_error:
@@ -280,7 +286,20 @@ class GazeKeyApp:
         settings = DwellSettings.from_config(self.config)
         if self.args.dwell is not None:
             settings.dwell_s = float(self.args.dwell)
+        settings.hysteresis_margin = self.tuning["hysteresis_margin"]
+        settings.grace_ms = self.tuning["grace_ms"]
         controller = DwellController(keyboard, settings)
+
+        self.typing = None
+        if self.args.debug_typing:
+            self.typing = TypingDiagnostics(
+                controller, key_size=keyboard.smallest_key(),
+                interval_s=float(self.args.debug_interval))
+            print(f"[GazeKey] --debug-typing: reporting every "
+                  f"{self.args.debug_interval:.0f} s. Tuning: hysteresis "
+                  f"{settings.hysteresis_margin:.2f}, grace "
+                  f"{settings.grace_ms:.0f} ms, min-cutoff "
+                  f"{self.tuning['min_cutoff']:.2f}")
         self.drift = DriftMonitor(
             validation_error_px=self.error_px,
             configured_offset_px=float(self.config.get("drift_offset_px", 0)),
@@ -295,6 +314,7 @@ class GazeKeyApp:
             show_webcam=bool(self.config.get("show_webcam_preview", True))
             and not self.args.no_webcam,
             drift=self.drift,
+            diagnostics=self.typing,
         )
         overlay.setGeometry(self.geometry)
         overlay.recalibrate_requested.connect(self.on_recalibrate)
@@ -450,6 +470,7 @@ class GazeKeyApp:
         self.app.quit()
 
     def shutdown(self) -> None:
+        self.report_typing()
         if self.hotkey is not None:
             self.hotkey.stop()
         if self.exit_button is not None:
@@ -464,6 +485,15 @@ class GazeKeyApp:
             self.injector.close()
         if self.predictor is not None:
             self.predictor.save()
+
+    def report_typing(self) -> None:
+        """Print the --debug-typing summary once, on the way out."""
+        if self.typing is None:
+            return
+        typing, self.typing = self.typing, None
+        typing.close(now=time.time())
+        for line in typing.summary_lines():
+            print(line)
 
     def _report_fixation(self) -> None:
         active = self.pipeline.fixation_dispersion_px
@@ -503,6 +533,30 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how much screen height the keyboard uses")
     parser.add_argument("--no-cursor", action="store_true")
     parser.add_argument("--no-webcam", action="store_true")
+
+    tuning = parser.add_argument_group(
+        "typing stability",
+        "knobs for unstable selection; each falls back to config, then to the "
+        "default, so an absent flag changes nothing"
+    )
+    tuning.add_argument("--hysteresis", type=float, default=None, metavar="F",
+                        help="focused key's hit region grows by this fraction "
+                             "per side (default 0.25). NOTE: hit regions are "
+                             "gapless, so this currently only acts at the "
+                             "board edge, not between keys")
+    tuning.add_argument("--min-cutoff", type=float, default=None, metavar="HZ",
+                        help="One-Euro min_cutoff (default 1.0); lower is "
+                             "smoother and laggier")
+    tuning.add_argument("--grace-ms", type=float, default=None, metavar="MS",
+                        help="dwell decay after leaving a key (default 200). "
+                             "NOTE: only reached when the gaze leaves every "
+                             "key, not on a focus steal")
+    tuning.add_argument("--debug-typing", action="store_true",
+                        help="log focus churn, dwell-loss causes, gaze "
+                             "std-dev per axis and fixation duty cycle while "
+                             "typing, then a summary on quit")
+    tuning.add_argument("--debug-interval", type=float, default=5.0,
+                        metavar="S", help="seconds between debug lines")
     parser.add_argument("--settle-ms", type=float, default=None)
     parser.add_argument("--collect-samples", type=int, default=None)
     parser.add_argument("--collect-max-s", type=float, default=None)

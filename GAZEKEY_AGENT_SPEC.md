@@ -17,7 +17,8 @@ not simplify it.
 
 **Status (2026-08-08): Milestones 1–5 are complete, plus word prediction pulled
 forward from M6, region-scoped calibration (Section 5.6) and point-level
-calibration repair (Section 5.3). 572 tests passing.** Remaining scope: M6 (Hebrew + RTL only),
+calibration repair (Section 5.3). 605 tests passing.**
+Typing stability is diagnosed but **not fixed** — see NFR-7. Remaining scope: M6 (Hebrew + RTL only),
 then the two end-to-end scenarios in Section 11.
 
 > **Where this document and the code disagree, what to do depends on the kind
@@ -82,6 +83,7 @@ interaction/
   layouts.py             key geometry, NFR-2 sizing, layout selection
   injector.py            pynput keystroke injection
   practice.py            post-calibration aiming drill
+  diagnostics.py         --debug-typing: focus churn, dwell losses, jitter
   prediction.py          offline word suggestions + personal counts
   hotkey.py              global Ctrl+Alt+Q quit listener
 ui/
@@ -487,10 +489,20 @@ State machine per focused key: `IDLE → FOCUS → DWELLING → ACTIVATED`.
 - Dwell advances **only while `is_fixating` is true** and gaze is inside the key.
 - **Hysteresis:** once a key is focused its hit region grows by 25% on each
   side; a new key only steals focus if gaze enters *its* unexpanded region.
-  Hit regions are gapless, so between two letters the neighbour wins outright —
-  what the margin really buys is the board's outer edge and the non-selectable
-  strips, where a slightly-off prediction would otherwise drop the dwell with
-  nothing to hand it to.
+
+  > **This rule is self-defeating as specified, and measured to be inert.**
+  > Hit regions are gapless, so inside the board *some* key's unexpanded region
+  > always contains the point and the challenger wins outright; the focused
+  > key's grown region is only ever consulted off the board. Ownership around a
+  > focused key is byte-identical at margins 0.0, 0.25, 0.45 and 0.90
+  > (`test_hysteresis_does_nothing_between_keys`). What the margin really buys
+  > is the board's outer edge and the non-selectable strips. Making it act
+  > between keys means changing the rule — see NFR-7 below.
+
+- **A focus steal discards the dwell instantly**, with no grace: `_decay` is
+  only reached when the gaze leaves *every* key. One frame of gaze crossing a
+  row boundary throws away however much dwell had accumulated. On a 93 px row
+  a 47 px wobble is enough, which is the reported H↔N↔Y flapping.
 - **Grace period:** on leaving the region the accumulated dwell decays over
   200 ms instead of resetting instantly.
 - **Refractory period:** 400 ms after activation during which the same key
@@ -636,6 +648,7 @@ keys are ignored, so an old or partial file never breaks startup.
   "calibration_collect_max_s": 4.0,
   "fixation_window_ms": 150,
   "fixation_dispersion_px": 110,
+  "one_euro_min_cutoff": 1.0,
   "tracking_hold_ms": 300,
   "drift_offset_px": 0
 }
@@ -679,6 +692,8 @@ checkpoint, before the next one starts.
 - `test_layouts.py` — NFR-2 sizing on both axes, layout selection, geometry.
 - `test_drift.py` / `test_touchup.py` — the M5 core, driven from explicit
   timestamps so the 3 s and 60 s boundaries are tested at their real values.
+- `test_typing_diagnostics.py` — the tuning-knob precedence (flag > config >
+  default), the dwell-loss accounting, and the two knobs measured to be inert.
 - `test_region.py` — region geometry, target placement, persistence, and that
   every gaze-selectable target (keys, the Quit boxes, the Fix aim dot, the
   drill) lands inside the calibrated area.
@@ -775,6 +790,42 @@ layout that actually complies at realistic webcam accuracy.
 **Non-compliance is a warning, never a block.** The app runs, prints the key
 size and the verdict, shows `keys below spec: …` in the corner with both axes,
 and names what would fix it.
+
+### NFR-7 — Typing stability (open; diagnosed, not yet fixed)
+
+A dwell that never completes is as unusable as a bad calibration. The keyboard
+must let a user hold a key through the residual wobble of their own gaze.
+
+**Measured state.** With a 44.3 px in-region calibration and 93 px rows, a
+single frame of vertical jitter steals focus and discards the whole
+accumulated dwell. Of the three tuning knobs, **two cannot affect this at
+all**: hysteresis is inert between keys (Section 7) and grace is never reached
+on a steal. Only `--min-cutoff` bites, by reducing the wobble itself.
+
+`--debug-typing` measures which of the three failure modes is actually in play:
+
+```
+[typing]  5.0s  focus 12.3/s  resets: steal 25  fixdrop 0  grace 0
+                jitter x   6 y  45 px  spread x 201 y  69  fixating 100%  keys 0
+```
+
+`jitter` is the median per-axis deviation inside ~1/3 s buckets — deliberately
+*not* the window-wide standard deviation, which is dominated by the user moving
+between keys and reads ~350 px on x while the real wobble is 6 px. Read it
+against the key size: jitter approaching a quarter of a key crosses boundaries
+routinely.
+
+**Candidate fixes, none adopted yet** (each is a product decision):
+
+1. **Sticky focus** — the focused key keeps ownership while the gaze is inside
+   its *grown* region, and a challenger must win outside it. This is what the
+   hysteresis margin was always meant to do, and it makes the existing knob
+   live. One line in `_hit_test`.
+2. **Carry the dwell across a steal** — apply the grace decay instead of
+   zeroing, making `--grace-ms` live.
+3. **Per-axis hysteresis** — rows are 93 px and columns 124–137 px, and the
+   vertical jitter is the larger, so a separate vertical margin targets the
+   axis that actually fails.
 
 ### NFR-3 — Robustness
 No crash when the camera is unplugged or held by another app. The overlay never
