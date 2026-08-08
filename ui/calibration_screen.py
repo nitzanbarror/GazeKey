@@ -20,14 +20,14 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QKeyEvent, QPainter, QPaintEvent, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget
 
 from gaze.calibration import MARGINAL_PX, MIN_SWEEP_POSE_RANGE_DEG, PASS_PX
-from gaze.calibration_session import CalibrationSession, Phase
+from gaze.calibration_session import CalibrationSession, Phase, to_ascii
 
 BACKGROUND = QColor(12, 12, 16)
 TEXT = QColor(232, 232, 238)
@@ -84,10 +84,14 @@ class CalibrationScreen(QWidget):
         pipeline=None,
         parent: Optional[QWidget] = None,
         tick_ms: int = 16,
+        log: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.pipeline = pipeline
+        #: where the session's running commentary goes (point repairs, mostly)
+        self.log = log if log is not None else (
+            lambda message: print(f"[GazeKey] {message}"))
         self._started = time.monotonic()
         self._last_valid = time.monotonic()
         self._saw_any_frame = False
@@ -112,6 +116,8 @@ class CalibrationScreen(QWidget):
                 if sample.valid:
                     self._last_valid = time.monotonic()
                 self.session.update(sample.features)
+        for message in self.session.take_messages():
+            self.log(to_ascii(message))
         self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt API
@@ -449,7 +455,7 @@ class CalibrationScreen(QWidget):
             painter.setPen(Qt.NoPen)
             painter.setBrush(_residual_colour(point.residual_px))
             painter.drawEllipse(centre, marker, marker)
-            if point.retries:
+            if point.retries or point.repaired:
                 painter.setPen(QPen(WARN, max(1.5, self.height() * 0.002)))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(centre, marker * 1.9, marker * 1.9)

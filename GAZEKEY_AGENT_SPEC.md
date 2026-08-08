@@ -16,8 +16,8 @@ minute and was unusable. Follow the calibration design in Section 5 exactly; do
 not simplify it.
 
 **Status (2026-08-08): Milestones 1–5 are complete, plus word prediction pulled
-forward from M6 and region-scoped calibration (Section 5.6). 558 tests
-passing.** Remaining scope: M6 (Hebrew + RTL only),
+forward from M6, region-scoped calibration (Section 5.6) and point-level
+calibration repair (Section 5.3). 572 tests passing.** Remaining scope: M6 (Hebrew + RTL only),
 then the two end-to-end scenarios in Section 11.
 
 > **Where this document and the code disagree, what to do depends on the kind
@@ -230,7 +230,47 @@ Features are standardized with std floors and clamped to ±3σ at prediction tim
 6. Fit the model on the 9 (feature → target) pairs. If fewer than 6 points
    produced usable data, fail out with an explanation rather than fitting.
 
-### 5.3 Validation gate (mandatory)
+### 5.3 Point-level repair, then the validation gate (mandatory)
+
+**Point-level repair — before validation, in every verdict band.** A ridge
+polynomial has only nine points to work with, so one target the user glanced
+away from drags the whole surface toward it. Waiting for the verdict to fail
+misses the case this exists for: one bad point turning an otherwise ~20–25 px
+session into a MARGINAL 102.7 px, which passes the FAIL threshold and is
+therefore never repaired.
+
+So immediately after the initial fit, and before any validation target is
+shown:
+
+- compute each calibration point's residual against that fit;
+- a point is **suspect** when its residual is **both > 3× the median residual
+  and > 60 px** — the ratio catches a point far worse than its peers, the
+  absolute floor stops ordinary scatter in a tight session being disturbed;
+- if **exactly one or two** points are suspect, re-collect those points once
+  and refit before validating. Three or more is not a glance away, it is
+  systemic (lighting, the head slipping, a knocked camera); re-collecting will
+  not fix it, and the diagnostics name the cause instead;
+- the console says what it is doing:
+  `point 2 fit poorly (283 px vs 77 px median) - re-collecting`, and the screen
+  shows the same "Improving accuracy" copy as the FAIL-path refit;
+- **keep the better of the two.** Both collections are scored against the same
+  model — the fit that flagged the point — so the comparison is fair; a
+  re-collection that came back worse, or produced no usable samples at all, is
+  discarded and the original kept. A repair never loses a point.
+- **once, ever.** The pass runs at most one time per session and cannot chain
+  into the FAIL-path refit below, so no input can make it loop.
+
+*Known limits of residual-based detection.* With six terms fitted to nine
+points, a single outlier has enough leverage to bend the surface toward itself
+and inflate its **neighbours'** residuals too. Measured against the synthetic
+eye, one glance away raises 1–2 points over the threshold in most target
+geometries (where the repair then fires and recovers the session — e.g. 59.6 px
+→ 19.0 px), but at the two corner positions it raises three or four, and the
+"exactly one or two" gate then declines to act. Leave-one-out residuals would
+unmask that, at the cost of nine extra least-squares solves; the trigger above
+is what is implemented.
+
+### 5.3b The validation gate (mandatory)
 
 7. Show **3 fresh validation targets** not on the 3×3 grid — at (30%, 30%),
    (70%, 70%) and (70%, 30%) **of the same region**. Collect the same way,
@@ -243,12 +283,15 @@ Features are standardized with std floors and clamped to ±3σ at prediction tim
    - **> 130 px → FAIL.** Not saved. Re-collect the 2 calibration points with
      the worst fit residuals, refit, re-validate once. If it still fails, show
      the guidance screen (face the camera, improve lighting, sit ~60 cm away,
-     keep the head still) and offer a restart.
+     keep the head still) and offer a restart. This is the same mechanism as
+     the point-level repair above, triggered by the verdict instead; the two
+     are each one-shot and cannot chain.
 9. **Display the measured error, always** (e.g. "Accuracy: 54 px — Good"),
    together with a diagnostics map: per-point residuals, kept/collected sample
-   counts, retry markers, validation arrows from target to prediction, the
-   hx/hy feature spread, which head mode ran, and one line naming the most
-   likely limiting cause. The same table is printed to the console every run.
+   counts, retry and re-collection markers, validation arrows from target to
+   prediction, the hx/hy feature spread, which head mode ran, which region was
+   measured, and one line naming the most likely limiting cause. The same
+   table — including every repair line — is printed to the console every run.
 
 ### 5.4 Persistence — and why there is no startup question
 
@@ -611,6 +654,7 @@ calibration error" (Section 5.5.1).
 | M4 | keyboard overlay + dwell + keystroke injection | **done** |
 | M5 | drift monitor + 1-point touch-up + in-place recalibration + PAUSE/RECALIBRATE keys | **done** |
 | — | region-scoped calibration (Section 5.6), practice made opt-in | **done** |
+| — | point-level calibration repair (Section 5.3) | **done** |
 | M6 | **Hebrew layout + RTL only** | next |
 
 Word prediction was pulled forward out of M6 and is done (Section 8.4), so M6
@@ -638,6 +682,10 @@ checkpoint, before the next one starts.
 - `test_region.py` — region geometry, target placement, persistence, and that
   every gaze-selectable target (keys, the Quit boxes, the Fix aim dot, the
   drill) lands inside the calibrated area.
+- `test_calibration_session.py` — point-level repair: a glanced-away point is
+  re-collected and the accuracy recovers, a clean session is left alone, three
+  outliers are treated as systemic, the worse collection is discarded and the
+  pass never loops.
 - `test_overlay.py` / `test_drift_ui.py` / `test_touchup_ui.py` — window
   contract, sample→activation→injection wiring, the drift indicator.
 - `test_m5_flow.py` / `test_main_flow.py` — application wiring: what is

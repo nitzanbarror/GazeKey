@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple
 
@@ -40,6 +40,25 @@ from gaze.region import Region, attach_region, full_screen_region
 
 #: fewest usable 9-point samples that still allow a meaningful 6-term fit
 MIN_USABLE_POINTS = 6
+
+# ------------------------------------------------------- point-level repair
+#: A single glance away during one target poisons the whole fit: the ridge
+#: polynomial has only nine points to work with, so one that lands hundreds of
+#: pixels out drags the surface toward it everywhere. Spec 5.3 already
+#: re-collects the two worst points, but only once the *verdict* has failed —
+#: which misses exactly the case that motivated this: an otherwise 20-25 px
+#: session dragged to a MARGINAL 102.7 px by one bad point. So the same
+#: mechanism also runs on point-level evidence, before validation.
+#:
+#: A point is suspect when its residual is both this multiple of the median...
+REPAIR_RESIDUAL_RATIO = 3.0
+#: ...and this many pixels in absolute terms, so a tight fit where everything
+#: is within a few px is never disturbed by ordinary scatter.
+REPAIR_RESIDUAL_MIN_PX = 60.0
+#: At most this many points are re-collected. Three or more outliers is not a
+#: glance away, it is a systemic problem (lighting, head slipping, a camera
+#: knocked) that re-collecting will not fix, and the diagnostics say so instead.
+MAX_REPAIRED_POINTS = 2
 
 #: typography the UI uses freely but a Windows console may not be able to encode
 _ASCII_MAP = {"°": " deg", "–": "-", "—": "-", "≤": "<=", "≥": ">=", "…": "...",
@@ -118,6 +137,8 @@ class PointDiagnostics:
     hy: float = float("nan")
     prediction: Optional[Tuple[float, float]] = None
     residual_px: float = float("nan")
+    #: this point was re-collected because it fitted far worse than the rest
+    repaired: bool = False
 
     @property
     def rejected(self) -> int:
@@ -141,6 +162,8 @@ class SessionDiagnostics:
     fixed_head: bool = True
     region: Optional[Region] = None
     screen_size: Tuple[int, int] = (0, 0)
+    #: what the point-level repair pass did, in the order it happened
+    repairs: List[str] = field(default_factory=list)
 
     @property
     def hx_span(self) -> float:
@@ -188,7 +211,10 @@ class SessionDiagnostics:
                 f"    {point.index:>2}  ({point.target[0]:5d},{point.target[1]:5d})"
                 f"  {residual}   {point.kept:>3}/{point.collected:<3}"
                 f"     {point.retries}"
+                f"{'   re-collected' if point.repaired else ''}"
             )
+        for line in self.repairs:
+            out.append(f"    * {line}")
         out.append("  validation targets   target     ->  prediction      error")
         for point in self.validation:
             if point.prediction is None:
@@ -272,6 +298,16 @@ class CalibrationSession:
         self._samples: List[np.ndarray] = []
         self._now: float = 0.0
         self._fitted = False
+
+        #: running commentary, for the console (see :meth:`take_messages`)
+        self.messages: List[str] = []
+        self._message_cursor = 0
+        #: indices of points the repair pass re-collected
+        self.repaired: List[int] = []
+        self._repair_done = False
+        #: idx -> (feature, residual, stats) kept while a repair is in flight,
+        #: so the worse of the two collections can be thrown away afterwards
+        self._repair_before: dict = {}
 
         if self.fixed_head:
             # The head is supported, so pose does not vary: the compensator
@@ -484,6 +520,11 @@ class CalibrationSession:
             self._evaluate()
 
     def _fit_and_validate(self) -> None:
+        # Returning from a repair pass? Settle it *before* refitting: the
+        # current model is the referee that both collections are judged by.
+        if self._repair_before:
+            self._resolve_repair()
+
         indices, features, targets = self._usable(Phase.POINTS)
         if len(indices) < MIN_USABLE_POINTS:
             self._fail_out(
@@ -493,8 +534,102 @@ class CalibrationSession:
             return
         self.model.fit(features, targets)
         self._fitted = True
+
+        if not self._repair_done:
+            suspect = self._suspect_points()
+            if suspect:
+                self._start_repair(suspect)
+                return
+
         self.refit_pass = False
         self._begin_stage(Phase.VALIDATION, list(range(len(self.val_targets))))
+
+    # -------------------------------------------------------- point repair
+    def take_messages(self) -> List[str]:
+        """Console lines produced since the last call (never re-reported)."""
+        pending = self.messages[self._message_cursor:]
+        self._message_cursor = len(self.messages)
+        return pending
+
+    def _residuals(self):
+        """``(indices, residuals)`` of the fitted points, in original order."""
+        indices, features, targets = self._usable(Phase.POINTS)
+        if not len(indices):
+            return [], np.zeros(0)
+        predicted = self.model.predict_many(features)
+        return indices, np.linalg.norm(predicted - targets, axis=1)
+
+    def _residual_of(self, feature, target) -> float:
+        """How far this one aggregate lands from its target, in px."""
+        if feature is None:
+            return float("inf")
+        px, py = self.model.predict(np.asarray(feature, dtype=float))
+        return float(np.hypot(px - target[0], py - target[1]))
+
+    def _suspect_points(self) -> List[int]:
+        """Points that fit far worse than the rest — one glance away, usually.
+
+        Empty unless one or two points stand out: three or more is systemic,
+        and re-collecting would only spend the user's patience.
+        """
+        indices, residuals = self._residuals()
+        if len(indices) < MIN_USABLE_POINTS:
+            return []
+        median = float(np.median(residuals))
+        suspect = [
+            indices[i] for i, residual in enumerate(residuals)
+            if residual > REPAIR_RESIDUAL_RATIO * median
+            and residual > REPAIR_RESIDUAL_MIN_PX
+        ]
+        return suspect if 1 <= len(suspect) <= MAX_REPAIRED_POINTS else []
+
+    def _start_repair(self, suspect: List[int]) -> None:
+        """Re-collect the suspect points once, then refit and validate."""
+        self._repair_done = True                 # only ever one repair pass
+        indices, residuals = self._residuals()
+        by_index = dict(zip(indices, residuals))
+        median = float(np.median(residuals))
+
+        for idx in suspect:
+            self._repair_before[idx] = (
+                self.cal_features[idx],
+                float(by_index[idx]),
+                self._stats.get((Phase.POINTS, idx)),
+            )
+            self.messages.append(
+                f"point {idx + 1} fit poorly "
+                f"({by_index[idx]:.0f} px vs {median:.0f} px median) "
+                f"- re-collecting"
+            )
+        self.refit_pass = True                   # the screen says "Improving"
+        self._begin_stage(Phase.POINTS, suspect)
+
+    def _resolve_repair(self) -> None:
+        """Keep whichever collection fits better, and never repeat the pass.
+
+        Both candidates are measured against the *same* model — the fit that
+        flagged the point — so the comparison is fair, and a re-collection that
+        went worse (or produced nothing) is simply discarded.
+        """
+        before, self._repair_before = self._repair_before, {}
+        for idx, (old_feature, old_residual, old_stats) in before.items():
+            target = self.cal_targets[idx]
+            new_residual = self._residual_of(self.cal_features[idx], target)
+            if new_residual <= old_residual:
+                self.messages.append(
+                    f"point {idx + 1} re-collected: {new_residual:.0f} px "
+                    f"(was {old_residual:.0f} px)"
+                )
+            else:
+                self.cal_features[idx] = old_feature
+                if old_stats is not None:
+                    self._stats[(Phase.POINTS, idx)] = old_stats
+                self.messages.append(
+                    f"point {idx + 1} re-collected no better "
+                    f"({new_residual:.0f} px vs {old_residual:.0f} px) "
+                    f"- keeping the first"
+                )
+            self.repaired.append(idx)
 
     def _evaluate(self) -> None:
         indices, features, targets = self._usable(Phase.VALIDATION)
@@ -563,6 +698,7 @@ class CalibrationSession:
                 collected=collected,
                 kept=kept,
                 retries=self._retries.get((phase, idx), 0),
+                repaired=(phase is Phase.POINTS and idx in self.repaired),
             )
             if feature is not None:
                 point.hx, point.hy = float(feature[0]), float(feature[1])
@@ -601,6 +737,7 @@ class CalibrationSession:
             fixed_head=self.fixed_head,
             region=self.region,
             screen_size=self.screen_size,
+            repairs=list(self.messages),
         )
         diagnostics.likely_cause = self._likely_cause(diagnostics)
         return diagnostics

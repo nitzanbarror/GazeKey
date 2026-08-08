@@ -158,10 +158,19 @@ What happens, in order:
    ring around the dot: **empty while it settles, filling while it measures**.
    A point that yields too little clean data repeats itself automatically (up
    to twice).
-2. **Three fresh validation targets** at different positions.
-3. **Results screen** with the measured error, the verdict, and the full
+2. **Point-level repair.** After the first fit, any point that fits both 3×
+   worse than the median *and* worse than 60 px is re-collected once and the
+   model refitted — before validation, in every verdict band. One glanced-away
+   target is enough to drag an otherwise 20-25 px session into MARGINAL, and
+   waiting for the verdict to fail never catches that. The console says
+   `point 2 fit poorly (283 px vs 77 px median) - re-collecting`. Three or more
+   bad points is systemic rather than a glance, so it is reported instead of
+   re-collected; whichever collection fits better is kept, and the pass runs at
+   most once.
+3. **Three fresh validation targets** at different positions.
+4. **Results screen** with the measured error, the verdict, and the full
    diagnostics map (below).
-4. **The keyboard.** (`--practice` inserts the aiming drill first; running
+5. **The keyboard.** (`--practice` inserts the aiming drill first; running
    `calibrate.py` instead ends at a free-form gaze-dot demo.)
 
 Keys: `Space` continue/repeat · `R` calibrate again · `Esc` cancel.

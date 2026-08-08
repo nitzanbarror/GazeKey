@@ -45,6 +45,8 @@ class SyntheticUser:
         settle_offset_px: tuple[float, float] = (0.0, 0.0),
         validation_offset_px: tuple[float, float] = (0.0, 0.0),
         invalid_points: dict[int, int] | None = None,
+        glance_points: dict[int, tuple[float, float]] | None = None,
+        glance_forever: bool = False,
     ) -> None:
         self.rng = np.random.default_rng(seed)
         self.noise = noise
@@ -54,8 +56,28 @@ class SyntheticUser:
         self.validation_offset_px = validation_offset_px
         #: target index -> how many attempts to sabotage with invalid frames
         self.invalid_points = dict(invalid_points or {})
+        #: target index -> px the user's gaze wanders off by while it collects,
+        #: i.e. "looked away while that dot was up"
+        self.glance_points = dict(glance_points or {})
+        #: keep glancing away on every re-collection, not just the first
+        self.glance_forever = glance_forever
         self.sweep_phase = 0.0
         self._attempt_seen: dict[int, int] = {}
+        self._visits: dict = {}
+        self._last_key = None
+        self._was_settling = False
+
+    def _visit(self, target) -> int:
+        """Which showing of this target we are in (1 = the first).
+
+        Keyed on (stage, position) so it works for validation targets too,
+        which do not appear in the 9-point grid at all.
+        """
+        key = (target.stage, target.position)
+        if key != self._last_key or (target.settling and not self._was_settling):
+            self._visits[key] = self._visits.get(key, 0) + 1
+        self._last_key, self._was_settling = key, target.settling
+        return self._visits[key]
 
     def _noisy(self, vector):
         return vector + np.concatenate([
@@ -83,6 +105,13 @@ class SyntheticUser:
             _target_key(session, target), -1
         ):
             return FrameFeatures(valid=False, timestamp=t)   # e.g. a long blink
+
+        visit = self._visit(target)
+        if target.stage is Phase.POINTS and not target.settling:
+            glance = self.glance_points.get(_target_key(session, target))
+            if glance and (self.glance_forever or visit == 1):
+                px += glance[0]
+                py += glance[1]
 
         if target.settling:
             px += self.settle_offset_px[0]
@@ -741,3 +770,176 @@ def test_fixed_head_drift_advice_points_at_the_head_sweep():
              for i in range(1, 4)]
     cause = session._likely_cause(diagnostics_stub(session, validation=loose))
     assert "head rest" in cause and "--with-head-sweep" in cause
+
+
+# ------------------------------------------------- point-level repair (5.3)
+# Offsets below are measured, not guessed: each reproduces a specific shape of
+# damage against this synthetic eye (see the table in the session module).
+GLANCE_ONE = (2, (-250.0, 150.0))        # one point clears 3x median and 60 px
+GLANCE_TWO = (8, (250.0, -150.0))        # two do
+GLANCE_SYSTEMIC = (5, (250.0, -150.0))   # three do — not a glance, a problem
+GLANCE_SMALL = (8, (150.0, -90.0))       # none do
+
+
+def glanced(key, offset, forever=False, seed=11, **kwargs):
+    """Drive a session in which one target is looked away from as it collects."""
+    session = new_session(**kwargs)
+    drive(session, SyntheticUser(seed=seed, glance_points={key: offset},
+                                 glance_forever=forever))
+    return session
+
+
+def repair_notices(session):
+    return [m for m in session.messages if "fit poorly" in m]
+
+
+def test_a_glanced_away_point_is_re_collected_before_validation():
+    key, offset = GLANCE_ONE
+    session = new_session()
+    seen = []
+    drive(session, SyntheticUser(seed=11, glance_points={key: offset}),
+          on_frame=lambda s: seen.append((s.phase, s.refit_pass)))
+
+    assert session.repaired == [key]
+    notices = repair_notices(session)
+    assert len(notices) == 1
+    assert notices[0].startswith(f"point {key + 1} fit poorly (")
+    assert "px vs" in notices[0] and notices[0].endswith("median) - re-collecting")
+
+    # it ran off point-level evidence, before any verdict existed
+    first_validation = next(i for i, (phase, _) in enumerate(seen)
+                            if phase is Phase.VALIDATION)
+    repair_frames = [i for i, (phase, refit) in enumerate(seen)
+                     if phase is Phase.POINTS and refit]
+    assert repair_frames, "no repair pass ran"
+    assert max(repair_frames) < first_validation
+
+
+def test_the_repair_rescues_the_accuracy(monkeypatch):
+    """The motivating case: one bad point dragging an otherwise good session."""
+    key, offset = GLANCE_ONE
+    with_repair = glanced(key, offset)
+
+    monkeypatch.setattr(CalibrationSession, "_suspect_points", lambda self: [])
+    without = glanced(key, offset)
+
+    assert without.error_px > 50.0, "the bad point should hurt when left alone"
+    assert with_repair.error_px < 30.0, "and the repair should undo most of it"
+    assert with_repair.error_px < without.error_px / 2
+
+
+def test_a_clean_calibration_is_left_alone():
+    session = new_session()
+    drive(session, SyntheticUser(seed=3))
+    assert session.repaired == []
+    assert session.messages == []
+    assert session.verdict == "PASS"
+
+
+def test_a_small_wobble_does_not_trigger_a_re_collection():
+    """3x the median is not enough on its own — it must clear 60 px too."""
+    session = glanced(*GLANCE_SMALL)
+    assert session.repaired == []
+    assert repair_notices(session) == []
+
+
+def test_two_bad_points_are_both_re_collected():
+    session = glanced(*GLANCE_TWO)
+    assert len(session.repaired) == 2
+    assert len(repair_notices(session)) == 2
+
+
+def test_three_outliers_are_treated_as_systemic_and_left_alone():
+    """More than two is not a glance away; re-collecting would not fix it."""
+    session = glanced(*GLANCE_SYSTEMIC)
+    assert session.repaired == []
+    assert repair_notices(session) == []
+    assert session.is_finished, "it still has to produce a verdict"
+
+
+def test_the_repair_never_loops():
+    """A point that is bad every time costs exactly one re-collection."""
+    key, offset = GLANCE_ONE
+    session = glanced(key, offset, forever=True)
+
+    assert session.repaired == [key], "one repair pass, ever"
+    assert len(repair_notices(session)) == 1
+    assert session.is_finished
+    assert session.cal_features[key] is not None, "a repair must never lose a point"
+
+
+def test_the_worse_of_the_two_collections_is_discarded():
+    """Both are judged by the same model, so the comparison is fair."""
+    session = new_session()
+    drive(session, SyntheticUser(seed=4))
+    assert session.is_finished
+
+    idx = 0
+    good = session.cal_features[idx]
+    good_residual = session._residual_of(good, session.cal_targets[idx])
+    bad = np.array([good[0] + 0.25, good[1] + 0.25, good[2], good[3]])
+
+    session._repair_before = {idx: (good, good_residual, (45, 45))}
+    session.cal_features[idx] = bad                  # the re-collection
+    session._resolve_repair()
+
+    assert np.allclose(session.cal_features[idx], good), "the worse one is dropped"
+    assert session.repaired == [idx]
+    assert "keeping the first" in session.messages[-1]
+
+
+def test_a_better_re_collection_is_kept():
+    session = new_session()
+    drive(session, SyntheticUser(seed=4))
+    idx = 0
+    good = session.cal_features[idx]
+    bad = np.array([good[0] + 0.25, good[1] + 0.25, good[2], good[3]])
+    bad_residual = session._residual_of(bad, session.cal_targets[idx])
+
+    session._repair_before = {idx: (bad, bad_residual, (45, 45))}
+    session.cal_features[idx] = good                 # the re-collection
+    session._resolve_repair()
+
+    assert np.allclose(session.cal_features[idx], good)
+    assert "re-collected:" in session.messages[-1] and "was" in session.messages[-1]
+
+
+def test_a_repair_that_collects_nothing_keeps_the_original():
+    session = new_session()
+    drive(session, SyntheticUser(seed=4))
+    idx = 0
+    good = session.cal_features[idx]
+    session._repair_before = {
+        idx: (good, session._residual_of(good, session.cal_targets[idx]), None)}
+    session.cal_features[idx] = None                 # the re-collection saw nothing
+    session._resolve_repair()
+
+    assert np.allclose(session.cal_features[idx], good), "never lose a point"
+
+
+def test_a_repaired_point_is_marked_in_the_diagnostics():
+    key, offset = GLANCE_ONE
+    session = glanced(key, offset)
+    diagnostics = session.diagnostics()
+
+    assert [p.index for p in diagnostics.points if p.repaired] == [key + 1]
+    report = diagnostics.console_report()
+    assert "re-collected" in report and "fit poorly" in report
+    report.encode("cp1255")            # console-safe on a Windows code page
+
+
+def test_messages_are_reported_to_the_console_once():
+    session = glanced(*GLANCE_ONE)
+    first = session.take_messages()
+    assert any("fit poorly" in m for m in first)
+    assert session.take_messages() == [], "already reported"
+
+
+def test_restarting_clears_the_repair_state():
+    session = glanced(*GLANCE_ONE)
+    assert session.repaired
+
+    session.restart()
+    assert session.repaired == []
+    assert session.messages == []
+    assert session.take_messages() == []
