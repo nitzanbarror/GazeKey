@@ -214,7 +214,7 @@ class GazeKeyApp:
             self.screen_size, region=self.region,
             min_hy_span=float(self.config.get(
                 "setup_check_min_hy_span", MIN_HY_SPAN)))
-        print(f"[GazeKey] setup check: 2 targets, ~{session.budget_s:.0f} s, "
+        print(f"[GazeKey] setup check: 2 targets, ~{session.typical_s:.0f} s, "
               f"need an hy span of {session.min_hy_span:.3f} "
               f"(--skip-setup-check to skip).")
         screen = SetupCheckScreen(session, self.pipeline)

@@ -58,6 +58,9 @@ class SetupCheckScreen(QWidget):
         self.log = log if log is not None else (
             lambda message: print(f"[GazeKey] {message}"))
         self._emitted = False
+        #: gaze queued before this screen existed is not evidence about a dot
+        #: the user had not been shown yet — see :meth:`_tick`
+        self._primed = False
 
         self.setWindowTitle("GazeKey — camera check")
         self.setStyleSheet("background: #0c0c10;")
@@ -71,13 +74,28 @@ class SetupCheckScreen(QWidget):
     # ------------------------------------------------------------------ input
     def _tick(self) -> None:
         if self.pipeline is not None:
-            for sample in self.pipeline.drain():
+            samples = self.pipeline.drain()
+            if not self._primed:
+                # Everything already in the queue was captured before this
+                # screen existed — while the camera warmed up, the banner
+                # printed and the window was created. Feeding it would spend
+                # the settle (and possibly a whole target) on frames from
+                # before the user had anything to look at. Spec Section 3.
+                self._primed = True
+                samples = []
+            for sample in samples:
                 result = self.session.update(sample.features)
                 if result is not None:
                     self.log(result.console_line())
                     if result.passed:
                         self._emit(result)
         self.update()
+
+    def restart(self) -> None:
+        """Re-run the check, discarding the gaze from the failure screen."""
+        if self.pipeline is not None:
+            self.pipeline.drain()
+        self.session.restart()
 
     def _emit(self, result) -> None:
         if self._emitted:
@@ -93,23 +111,40 @@ class SetupCheckScreen(QWidget):
             if key in (Qt.Key_Return, Qt.Key_Enter):
                 self._emit(self.session.override())      # calibrate anyway
             elif key in (Qt.Key_Space, Qt.Key_R):
-                self.session.restart()
+                self.restart()
 
     # -------------------------------------------------------------------- copy
     def text_lines(self) -> List[Tuple[str, float, int, QColor]]:
         """``(text, y fraction, size, colour)`` — what the painter draws."""
+        if self.session.phase is SetupPhase.LEAD_IN:
+            return self._lead_in_lines()
         if self.session.phase is SetupPhase.MEASURING:
             return self._measuring_lines()
         return self._failed_lines()
 
+    def _lead_in_lines(self):
+        """Everything the user has to read, while nothing is being measured.
+
+        The explanation lives here rather than beside the dots on purpose: the
+        first version put it next to the first target and then measured the
+        user while they were still reading it, which is exactly how the check
+        came to report a span four times too small.
+        """
+        return [
+            ("Quick camera check", 0.20, 24, DIM),
+            ("Two dots are about to appear", 0.26, 40, TEXT),
+            ("Look straight at each one and hold. It takes about "
+             f"{self.session.typical_s:.0f} seconds, and checks that the camera "
+             "can see your eyes move up and down.", 0.36, 28, TEXT),
+            ("Esc to cancel", 0.93, 18, DIM),
+        ]
+
     def _measuring_lines(self):
+        """Almost nothing: the dot is the instruction now."""
         target = self.session.current_target()
         counter = "" if target is None else f"   {target.index} / {target.total}"
         return [
-            (f"Quick camera check{counter}", 0.06, 24, DIM),
-            ("Look at the dot", 0.13, 34, TEXT),
-            (f"About {self.session.budget_s:.0f} seconds — checking that the "
-             f"camera can see your eyes move up and down", 0.19, 22, DIM),
+            (f"Look at the dot{counter}", 0.06, 24, DIM),
             ("Esc to cancel", 0.93, 18, DIM),
         ]
 

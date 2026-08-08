@@ -19,7 +19,7 @@ not simplify it.
 forward from M6, region-scoped calibration (Section 5.6), point-level
 calibration repair (Section 5.3), the typing-stability fixes of NFR-7 (sticky
 focus and a dwell that survives a steal) and the setup check of Section 5.1c.
-649 tests passing.**
+660 tests passing.**
 The NFR-7 fixes are implemented and tested but **not yet measured on hardware**
 — the after-measurement with `--debug-typing` is the next thing to do.
 Remaining scope: M6 (Hebrew + RTL only), then the two end-to-end scenarios in
@@ -213,27 +213,65 @@ the app is bad. Two measured sittings on the development machine:
 | sitting | hy span | calibration |
 |---|---|---|
 | camera at eye height | **0.051** | PASS 44.3 px |
+| camera at eye height, another session | **0.042** | PASS 57.3 px |
 | camera below eye height | **0.024** | MARGINAL 117.5 px, 0 keys typed in 47 s |
 
 So `python main.py` measures that number **first**, in about five seconds
 (`gaze/setup_check.py`, `ui/setup_check_screen.py`):
 
-1. Two still targets in the same visual language as calibration — a neutral dot
+1. A **lead-in** (~1.5 s): the instructions, and **no dot and no measurement**.
+   Everything the user has to read is here, so that reading it is not charged
+   to a target's median, and the first dot's appearance is itself the cue to
+   look. See "Pacing" below — this is not decoration.
+2. Two still targets in the same visual language as calibration — a neutral dot
    with a thin ring filling around it — at the **top and bottom centre of the
    calibration region**, at exactly the 10% and 90% heights the 3×3 grid uses,
    so the number is directly comparable with the `hy span` printed after a
-   session. 500 ms settle, then 30 valid samples or 2.0 s per target.
-2. The **median** hy at each; the span between them is the measurement.
-3. Below `setup_check_min_hy_span` (**0.035**, between the two measured
-   sittings and deliberately nearer the bad one) the screen says
+   session. 1000 ms settle, then 30 valid samples or 2.0 s per target. While
+   they are showing, the only copy is "Look at the dot   1 / 2".
+3. Each target is aggregated by the **verified `aggregate_point`** — the same
+   1.5×IQR rejection and median a calibration point gets — so the span is the
+   same quantity the diagnostics print rather than a lookalike computed a
+   second way. The span between the two medians is the measurement.
+4. Below `setup_check_min_hy_span` (**0.035**, between the measured sittings
+   and deliberately nearer the bad one) the screen says
    **"Camera looks too low — raise the laptop so the camera is at eye height"**
-   and shows the measurement. Fewer than 10 usable samples on either target is
-   reported differently — that is lighting or distance, not camera height.
-4. **It never blocks.** Space re-runs the check, Enter calibrates anyway (and
-   the console says the result was overridden), Esc quits. A passing check shows
-   no screen at all: it prints the span and goes straight to the dots.
-5. The measured span is printed **either way**, pass or fail.
-6. `--skip-setup-check` skips it entirely.
+   and shows the measurement. Fewer than `MIN_SAMPLES_PER_POINT` kept samples
+   on either target is reported differently — that is lighting or distance, not
+   camera height.
+5. **It never blocks.** Space re-runs the check *from the lead-in*, Enter
+   calibrates anyway (and the console says the result was overridden), Esc
+   quits. A passing check shows no screen at all: it prints the span and goes
+   straight to the dots.
+6. The measured span is printed **either way**, pass or fail, with the
+   kept/collected counts.
+7. `--skip-setup-check` skips it entirely.
+
+**Pacing — why the check is paced at all** (found in production, P0). The first
+version measured from the instant the screen appeared and put the explanation
+next to the first dot. A median flips **wholesale** once more than half its
+samples are stale, so a user still reading was not measured approximately — they
+were measured *entirely* on where they had been looking, and the span collapsed
+toward zero instead of degrading. On a sitting that calibrates to 0.042 it read
+**0.006 / 0.008 / 0.009 / 0.011 / 0.016 across five consecutive runs**, failing
+every time, with the two medians landing on the centre of the screen (0.478 and
+0.486) rather than on the dots. Three rules follow, and each is load-bearing:
+
+- **A target tolerates `settle + collect/2` of reaction**, and nothing more.
+  At the original 500 ms / 30 samples that was 1.05 s — less than it takes to
+  read three lines of instructions. At 1000 ms / 30 samples it is **1.5 s**,
+  against the ~0.3 s a saccade to a dot appearing on a still screen takes.
+  `SetupCheckSession.reaction_budget_s` states it, and a test pins it.
+- **Everything the user must read happens in the lead-in**, before any target.
+- **The screen discards the gaze queued before it existed** (spec Section 3:
+  the queue is unbounded and nothing else drains it between `wait_for_camera`
+  and the first tick), and again on a retry. Frames captured before a dot was
+  shown are not evidence about that dot.
+
+The rendered dot positions are checked against the calibration grid's extreme
+rows **in screen pixels on a full-size window**, not in region-normalised
+space — checking the session's own numbers against themselves is what let this
+go unnoticed.
 
 **Answered from the keyboard, not by gaze, and therefore startup-only — a
 product rule** (approved 2026-08-08; CLAUDE.md rule 9 applies). There is no
@@ -777,10 +815,14 @@ checkpoint, before the next one starts.
   the decay follows `grace-ms`, a key always owns its core, and the refractory
   is unaffected by a carried dwell.
 - `test_setup_check.py` / `test_setup_check_ui.py` — the gate of Section 5.1c:
-  the two measured sittings land either side of the threshold, the targets sit
-  on the calibration rows and inside the region, too few samples fail
-  differently from a low span, a retry measures from scratch, and continuing
-  anyway is recorded rather than hidden.
+  the measured sittings land either side of the threshold, the targets sit on
+  the calibration rows and inside the region, too few samples fail differently
+  from a low span, a retry measures from scratch, and continuing anyway is
+  recorded rather than hidden. Plus the three that pin the P0 fix: **a user
+  reacting at human speed (up to 1.2 s) is measured correctly**, the lead-in
+  feeds no target, a stale backlog cannot spend one, and **the painted dots
+  land on the calibration grid's extreme rows in screen pixels** at full
+  resolution.
 - `test_region.py` — region geometry, target placement, persistence, and that
   every gaze-selectable target (keys, the Quit boxes, the Fix aim dot, the
   drill) lands inside the calibrated area.

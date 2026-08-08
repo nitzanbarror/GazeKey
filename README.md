@@ -50,16 +50,27 @@ launch
 **The setup check comes first, and takes about five seconds.** A camera below
 eye height is the single most common way a session is wasted: the eyelids crop
 the iris, the vertical signal collapses, and the user only finds out forty
-seconds later as a verdict they cannot interpret. Two dots — top and bottom of
-the calibration area — measure how far the vertical iris ratio actually travels.
-Measured on this machine: **0.051 sitting well, 0.024 with the camera too low**
-(which calibrated to 117 px and typed nothing at all in 47 s). Below the
-threshold (0.035) the screen says *"Camera looks too low — raise the laptop so
-the camera is at eye height"*, and offers **Space** to check again, **Enter** to
-calibrate anyway, **Esc** to quit. It never blocks, it always prints the number,
-and `--skip-setup-check` turns it off. It runs at startup only: it is answered
-from the keyboard (there is no calibration yet to aim with), and raising a
-camera needs hands anyway.
+seconds later as a verdict they cannot interpret. It reads the instructions to
+you first (a lead-in with nothing being measured), then shows two dots — top and
+bottom of the calibration area — and measures how far the vertical iris ratio
+actually travels. Measured on this machine: **0.051 and 0.042 sitting well**
+(44 px and 57 px calibrations), **0.024 with the camera too low** (117 px, and
+nothing typable in 47 s). Below the threshold (0.035) the screen says *"Camera
+looks too low — raise the laptop so the camera is at eye height"*, and offers
+**Space** to check again, **Enter** to calibrate anyway, **Esc** to quit. It
+never blocks, it always prints the number, and `--skip-setup-check` turns it
+off. It runs at startup only: it is answered from the keyboard (there is no
+calibration yet to aim with), and raising a camera needs hands anyway.
+
+> **Why it has a lead-in.** The first version started measuring the moment the
+> screen appeared, with the explanation printed next to the first dot. A median
+> flips wholesale once more than half its samples are stale, so a user still
+> reading was measured *entirely* on where they had been looking, and the span
+> collapsed toward zero rather than degrading — five consecutive runs read
+> 0.006–0.016 on a sitting that really spans 0.042, and failed every one. A
+> target now tolerates `settle + collect/2` = **1.5 s** of reaction, everything
+> to read happens before any dot, and the screen throws away gaze captured
+> before it existed. Spec 5.1c has the detail.
 
 **Every launch calibrates.** There is no "use the saved one?" question, because
 for these users the honest answer is almost always *no*: the head is re-seated
@@ -304,15 +315,17 @@ diagnostics line of every result.
 | `--skip-setup-check` | skip the two-target camera check before calibration |
 | `setup_check_min_hy_span` | the threshold it judges against (config, default **0.035**) |
 
-Two dots at the top and bottom of the calibration area, ~5 s, measuring how far
-the vertical iris ratio travels between them — the same `hy span` the
-diagnostics print after a session, so the two numbers can be compared directly.
+A lead-in with the instructions, then two dots at the top and bottom of the
+calibration area — ~5.5 s in total — measuring how far the vertical iris ratio
+travels between them. Each dot is aggregated by the *same* verified
+IQR-plus-median the calibration points use, so the number is the same `hy span`
+the diagnostics print after a session and the two can be compared directly.
 Below the threshold it says the camera looks too low and offers **Space** to
-re-check, **Enter** to calibrate anyway and **Esc** to quit. The measurement is
-printed either way:
+re-check (from the lead-in), **Enter** to calibrate anyway and **Esc** to quit.
+The measurement is printed either way:
 
 ```
-[GazeKey] setup check PASS: hy span 0.051 (top 0.302, bottom 0.353, 30+30 samples, threshold 0.035)
+[GazeKey] setup check PASS: hy span 0.051 (top 0.302, bottom 0.353, kept 28/30+29/30, threshold 0.035)
 ```
 
 ### Pacing
